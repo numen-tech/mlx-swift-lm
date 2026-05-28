@@ -81,6 +81,7 @@ jobs:
       - name: Verify MetalToolchain installed
         shell: bash
         run: xcodebuild -showComponent MetalToolchain
+        uname -a
 
       - name: Build (Xcode, macOS)
         shell: sh
