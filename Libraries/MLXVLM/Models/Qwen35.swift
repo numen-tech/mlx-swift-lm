@@ -921,6 +921,26 @@ enum Qwen35Language {
             imageGridTHW: [THW]? = nil,
             videoGridTHW: [THW]? = nil
         ) -> LMOutput {
+            let hidden = hiddenStates(
+                inputs, inputsEmbeds: inputsEmbeds, cache: cache, mask: mask,
+                positionIds: providedPositionIds, pixelValues: pixelValues,
+                imageGridTHW: imageGridTHW, videoGridTHW: videoGridTHW)
+            return LMOutput(logits: applyLMHead(hidden))
+        }
+
+        /// Post-final-norm hidden states — everything `callAsFunction` does except the LM head.
+        /// Added for NumenKit's speculative verify seam (Qwen MTP self-speculative decoding); a
+        /// behavior-preserving split (the `callAsFunction` logits path is unchanged).
+        func hiddenStates(
+            _ inputs: MLXArray,
+            inputsEmbeds: MLXArray? = nil,
+            cache: [KVCache?]? = nil,
+            mask: MLXArray? = nil,
+            positionIds providedPositionIds: MLXArray? = nil,
+            pixelValues: MLXArray? = nil,
+            imageGridTHW: [THW]? = nil,
+            videoGridTHW: [THW]? = nil
+        ) -> MLXArray {
             if pixelValues != nil {
                 precomputedPositionIds = nil
                 ropeDeltas = nil
@@ -987,20 +1007,21 @@ enum Qwen35Language {
                 }
             }
 
-            var out = model(
+            return model(
                 inputs,
                 inputsEmbeds: inputsEmbeds,
                 cache: cache,
                 positionIds: positionIds
             )
+        }
 
+        /// Apply the (tied or untied) LM head to hidden states. Paired with `hiddenStates` for the
+        /// NumenKit speculative seam.
+        func applyLMHead(_ hidden: MLXArray) -> MLXArray {
             if let lmHead {
-                out = lmHead(out)
-            } else {
-                out = model.embedTokens.asLinear(out)
+                return lmHead(hidden)
             }
-
-            return LMOutput(logits: out)
+            return model.embedTokens.asLinear(hidden)
         }
 
         func makeCache(maxKVSize: Int?) -> [KVCache] {
@@ -1177,6 +1198,39 @@ public class Qwen35: Module, VLMModel {
             videoGridTHW: nil
         )
         return result.logits
+    }
+
+    // MARK: - NumenKit speculative seam (Qwen MTP self-speculative decoding)
+    //
+    // Public accessors that expose the language model's text forward as separate
+    // hidden-states / LM-head / embedding stages, so a downstream package can run a
+    // speculative draft/verify loop (which needs post-final-norm hidden states the
+    // stock fused forward does not surface). Text-only (no pixels / image grid) and
+    // behavior-preserving — they delegate to the existing internal forward with no
+    // numeric change. Upstreamable; see numen-tech fork.
+
+    /// Post-final-norm hidden states for a text token sequence, `[B, T, hidden]`.
+    public func backboneHidden(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
+        languageModel.hiddenStates(
+            inputs,
+            inputsEmbeds: nil,
+            cache: castCacheOptional(cache),
+            mask: nil,
+            positionIds: nil,
+            pixelValues: nil,
+            imageGridTHW: nil,
+            videoGridTHW: nil
+        )
+    }
+
+    /// Logits from hidden states via the (tied or untied) LM head, `[B, T, vocab]`.
+    public func backboneLogits(fromHidden hidden: MLXArray) -> MLXArray {
+        languageModel.applyLMHead(hidden)
+    }
+
+    /// Input token embeddings (no scaling), `[..., hidden]`.
+    public func backboneEmbed(_ ids: MLXArray) -> MLXArray {
+        languageModel.model.embedTokens(ids)
     }
 
     public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
