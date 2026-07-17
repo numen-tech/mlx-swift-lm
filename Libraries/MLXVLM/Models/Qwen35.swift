@@ -1246,29 +1246,44 @@ public class Qwen35: Module, VLMModel {
 
     /// Post-final-norm hidden states for a text token sequence, `[B, T, hidden]`.
     ///
-    /// CAVEAT (post-`c3b1d5f` upstream rebase): the vendor forward now threads M-RoPE
-    /// position-continuation bookkeeping (`qwen35.precomputedPositionIds` /
-    /// `qwen35.ropeDeltas`) through an explicit `LMOutput.State` the *caller* must carry
-    /// across calls, rather than the instance-level vars this seam was originally cut
-    /// against (3.31.3 / `1c05248`). This accessor still takes no `state` param — matching
-    /// the fixed downstream contract (`NumenCore/Speculative/NumenSpeculatableModel.swift`'s
-    /// `hidden(_:cache:)`, already consumed by `Qwen35Speculative.swift`) — so it calls
-    /// `hiddenStates` with `state: nil` and discards the returned state on every call. That
-    /// is exactly what a single `callAsFunction(inputs, cache:, state: nil, ...)` call would
-    /// do (the split's invariant holds per-call), but it means **repeated** calls into a
-    /// cache with `offset > 0` recompute M-RoPE positions from `getRopeIndex` with no
-    /// `positionOffset`, i.e. 0-based, instead of continuing from the cache offset — a
-    /// silent position-id bug for multi-round callers (e.g. NumenKit's MTP draft/verify
-    /// loop, `SpeculativeLoop.swift`, which calls `hidden(_:cache:)` repeatedly against one
-    /// growing cache within a turn). Flagged for review; see Task 3 report.
+    /// Position-correct on a warm cache (Task 3 review finding). This accessor takes no
+    /// `state` param — matching the fixed downstream contract
+    /// (`NumenCore/Speculative/NumenSpeculatableModel.swift`'s `hidden(_:cache:)`, consumed
+    /// by `Qwen35Speculative.swift`'s draft/verify loop, which calls this repeatedly against
+    /// one growing cache within a turn) — so it calls `hiddenStates` with `state: nil` and
+    /// discards the returned state. Left to its own devices, `hiddenStates`'s state-less
+    /// recompute branch (Qwen35.swift:843-867) would force-fire on every such call and pass
+    /// `getRopeIndex` no `positionOffset` (defaults to 0, Qwen3VL.swift:1428) — restarting
+    /// M-RoPE at zero instead of continuing from the cache. Every stock warm-cache caller
+    /// avoids this by routing through `prepare()` → `prepareContinuation()`, which derives
+    /// `positionOffset` from `faCacheOffset(cache)` (plus an image-carried rope delta) and
+    /// passes explicit `positionIds` in. This seam does the same, minus the image term (it is
+    /// text-only, so that term is always 0): derive the offset from `faCacheOffset(cache)` —
+    /// the same helper `prepareContinuation` uses — and pass the resulting `positionIds`
+    /// explicitly, which bypasses the buggy recompute branch entirely (it only fires when
+    /// `positionIds` is nil). A cold cache (`faCacheOffset == 0`) computes the identical
+    /// `arange` positions the old unconditional call produced, so cold-cache behavior is
+    /// unchanged.
     public func backboneHidden(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
-        languageModel.hiddenStates(
+        let cacheOffset = cache.map(faCacheOffset) ?? 0
+        let inputs2D = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
+        let (positionIds, _) = Qwen3VLLanguage.getRopeIndex(
+            inputIds: inputs2D,
+            imageGridTHW: nil,
+            videoGridTHW: nil,
+            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+            imageTokenId: config.imageTokenId,
+            videoTokenId: config.videoTokenId,
+            visionStartTokenId: config.visionStartTokenId,
+            positionOffset: cacheOffset)
+
+        return languageModel.hiddenStates(
             inputs,
             inputsEmbeds: nil,
             cache: castCacheOptional(cache),
             state: nil,
             mask: nil,
-            positionIds: nil,
+            positionIds: positionIds,
             pixelValues: nil,
             imageGridTHW: nil,
             videoGridTHW: nil

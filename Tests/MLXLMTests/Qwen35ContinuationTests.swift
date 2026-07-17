@@ -229,6 +229,58 @@ final class Qwen35ContinuationTests: XCTestCase {
             "post-image resume state positioned the following turn wrong")
     }
 
+    /// `backboneHidden` (Task 3 review finding) must be position-correct on a
+    /// warm cache: repeated state-less calls into a cache that already holds
+    /// a prefix must anchor M-RoPE at the cache offset, not restart at zero —
+    /// the same invariant `prepare`'s warm continuation upholds via
+    /// `prepareContinuation`. The NumenKit speculative seam
+    /// (`SpeculativeLoop.swift`) calls `backboneHidden` repeatedly against
+    /// one growing cache within a turn, exactly this pattern.
+    func testBackboneHiddenWarmCacheMatchesFullPrefill() throws {
+        MLXRandom.seed(17)
+        let model = try makeTinyModel()
+        let t1 = textTokens(40)
+        let t2 = textTokens(8, seed: 3)
+        let full = concatenated([t1, t2], axis: 1)
+
+        // Reference: one cold prefill of the whole sequence.
+        let cacheF = model.newCache(parameters: nil)
+        let (logitsF, _) = try lastLogits(
+            model.prepare(
+                LMInput(text: .init(tokens: full)), cache: cacheF, state: nil, windowSize: nil))
+
+        // Control: decode path, token by token, state threaded. Correct by
+        // construction; its divergence from F is the numerical noise floor.
+        let cacheD = model.newCache(parameters: nil)
+        let (_, s0) = try lastLogits(
+            model.prepare(
+                LMInput(text: .init(tokens: t1)), cache: cacheD, state: nil, windowSize: nil))
+        var state = s0
+        var logitsD = MLXArray(0)
+        for j in 0 ..< t2.dim(1) {
+            let out = model(
+                LMInput.Text(tokens: t2[0..., j ..< (j + 1)]), cache: cacheD, state: state)
+            state = out.state
+            logitsD = out.logits[0..., -1, 0...]
+        }
+        let noiseFloor = maxAbsDiff(logitsD, logitsF)
+
+        // `backboneHidden` against a warm cache — the seam's own call
+        // pattern: no carried state, repeated calls into one growing cache.
+        let cacheB = model.newCache(parameters: nil)
+        _ = try lastLogits(
+            model.prepare(
+                LMInput(text: .init(tokens: t1)), cache: cacheB, state: nil, windowSize: nil))
+        let hidden = model.backboneHidden(t2, cache: cacheB)
+        let logitsB = model.backboneLogits(fromHidden: hidden)[0..., -1, 0...]
+
+        let drift = maxAbsDiff(logitsB, logitsF)
+        XCTAssertLessThanOrEqual(
+            drift, max(noiseFloor * 10, 1e-3),
+            "backboneHidden on a warm cache diverged from full prefill (noise floor \(noiseFloor))"
+        )
+    }
+
     /// Windowed (chunked) prefill must produce the same first-token logits as
     /// the single-shot forward — on plain text and on an image-bearing prompt
     /// whose image straddles a window boundary.
