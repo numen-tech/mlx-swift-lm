@@ -10,6 +10,21 @@ import MLXNN
 
 private enum Qwen3VLError: Error {
     case featureTokenMismatch(expected: Int, actual: Int)
+
+    /// `releaseVisionResources(reloadingFrom:)` found a `vision_tower.*.scales` key in the
+    /// checkpoint. A quantized vision tower needs `quantize(model:)`'s structural module
+    /// surgery (`Linear` -> `QuantizedLinear`) at load time; this release path only ever
+    /// swaps parameter *values* into the existing module structure, so it cannot safely
+    /// reconstruct a quantized tower and refuses rather than silently mis-updating it.
+    case quantizedVisionTowerUnsupported
+
+    /// `releaseVisionResources(reloadingFrom:)`: the checkpoint at the given directory is
+    /// missing a key the current vision tower's parameter structure requires.
+    case missingVisionWeight(key: String)
+
+    /// `releaseVisionResources(reloadingFrom:)`: a checkpoint weight's shape doesn't match
+    /// the current vision-tower parameter it would replace.
+    case visionWeightShapeMismatch(key: String, expected: [Int], actual: [Int])
 }
 
 private let ropeDeltasKey = LMOutput.Key<MLXArray>("qwen35vl.ropeDeltas")
@@ -1840,6 +1855,77 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
 
         let sanitized = visionModel.sanitize(weights: adjusted)
         return sanitized
+    }
+}
+
+// MARK: - Progressive vision-weight release (VisionResourceReleasing)
+//
+// See `VisionResourceReleasing`'s doc comment for the full why/contract. This reload
+// mirrors `loadWeights(modelDirectory:model:...)` (MLXLMCommon/Load.swift) exactly in
+// mapping terms -- same safetensors enumeration (`safetensorWeightURLs`), same
+// `sanitize(weights:)` -- but scoped to the `vision_tower` subtree, and it deliberately
+// does not re-derive `loadWeights`'s dtype-cast policy: instead each replacement array is
+// cast to whatever dtype the CURRENT (already-materialized) parameter holds, which
+// reproduces the same numerics the tower's first materialization landed on without this
+// seam needing to know how that cast was decided.
+extension Qwen3VL: VisionResourceReleasing {
+    public func releaseVisionResources(reloadingFrom modelDirectory: URL) throws {
+        // a. Enumerate + lazily (mmap) load every safetensors file backing this
+        // checkpoint. No eval anywhere in this function: `loadArrays` returns lazy,
+        // mmap-backed arrays, same as the initial load.
+        var rawWeights: [String: MLXArray] = [:]
+        for url in try safetensorWeightURLs(in: modelDirectory) {
+            for (key, value) in try loadArrays(url: url) {
+                rawWeights[key] = value
+            }
+        }
+
+        // b. The model's own sanitize -- top-level key renames (`model.visual` ->
+        // `vision_tower`, tied lm_head drop) followed by `VisionModel.sanitize`'s
+        // `patch_embed.proj.weight` transpose and dropped `position_ids` -- byte-for-byte
+        // the same mapping `loadWeights` applies via `BaseLanguageModel.sanitize`.
+        let sanitized = sanitize(weights: rawWeights)
+
+        // c. Filter to the vision tower's subtree and strip the prefix so keys are
+        // relative to `visionModel`, matching `visionModel.parameters()`'s own paths.
+        let visionPrefix = "vision_tower."
+        var loaded: [String: MLXArray] = [:]
+        for (key, value) in sanitized where key.hasPrefix(visionPrefix) {
+            loaded[String(key.dropFirst(visionPrefix.count))] = value
+        }
+
+        // Guard: a quantized vision tower would need `quantize(model:)`'s structural
+        // module surgery to even accept these keys (see `Qwen3VLError
+        // .quantizedVisionTowerUnsupported`'s doc comment) -- refuse rather than risk a
+        // silent mis-update.
+        if loaded.keys.contains(where: { $0.hasSuffix(".scales") }) {
+            throw Qwen3VLError.quantizedVisionTowerUnsupported
+        }
+
+        // d/e. Atomic-or-throw: validate every current vision-tower parameter has a
+        // same-shaped checkpoint match, casting each replacement to the CURRENT
+        // parameter's dtype, before touching any model state. Nothing below this loop
+        // mutates `visionModel` until the loop has fully succeeded.
+        let currentParameters = visionModel.parameters().flattened()
+        var replacement: [String: MLXArray] = [:]
+        replacement.reserveCapacity(currentParameters.count)
+        for (key, currentValue) in currentParameters {
+            guard let loadedValue = loaded[key] else {
+                throw Qwen3VLError.missingVisionWeight(key: key)
+            }
+            guard loadedValue.shape == currentValue.shape else {
+                throw Qwen3VLError.visionWeightShapeMismatch(
+                    key: key, expected: currentValue.shape, actual: loadedValue.shape)
+            }
+            replacement[key] = loadedValue.asType(currentValue.dtype)
+        }
+
+        // f. Exactly one update call, only reached after full validation above -- mirrors
+        // the verify options `loadWeights` uses for the initial load (`Load.swift`). This
+        // is an in-place parameter swap (not module re-creation): it drops the last
+        // references to the old materialized buffers, which is what actually frees them.
+        try visionModel.update(
+            parameters: ModuleParameters.unflattened(replacement), verify: [.all])
     }
 }
 
