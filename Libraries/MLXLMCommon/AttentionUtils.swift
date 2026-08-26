@@ -10,6 +10,7 @@ import MLX
 ///
 /// This function matches Python's `scaled_dot_product_attention` in base.py:
 /// - Detects if cache is `QuantizedKVCache` using `isinstance` pattern
+/// - Detects cache-native attention implementations
 /// - Routes to `quantizedScaledDotProductAttention` or `MLXFast.scaledDotProductAttention`
 /// - Handles cache updating automatically
 /// - Transparent to models - they just call this function
@@ -51,7 +52,32 @@ public func attentionWithCacheUpdate(
             mask: mask
         )
     }
-    if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
+    if let turboCache = cache as? TurboQuantKVCache {
+        let L = queries.dim(2)
+        if L > 1 && !turboCache.isCompressed {
+            // Prefill (L>1) on a raw cache: plain update + standard SDPA, // zero overhead; compression is deferred to the first decode step.
+            let (cachedKeys, cachedValues) = turboCache.update(keys: keys, values: values)
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: cachedKeys, values: cachedValues,
+                scale: scale, mask: mask
+            )
+        }
+        // Decode (L=1) or any call once the cache is compressed (speculative
+        // verify chunks, multi-turn re-prefill): the compressed path. The raw
+        // update() path is invalid after compression, its raw buffers are
+        // gone. First decode call triggers compressRawCache().
+        return turboCache.compressedAttention(
+            queries: queries, keys: keys, values: values,
+            scale: scale, mask: mask
+        )
+    } else if let attentionCache = cache as? KVCacheAttentionProtocol {
+        return attentionCache.updateAndAttend(
+            queries: queries,
+            keys: keys,
+            values: values,
+            scale: scale,
+            mask: mask)
+    } else if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
         let (quantizedKeys, quantizedValues) = quantizedKVCache.updateQuantized(
             keys: keys, values: values)
         return quantizedScaledDotProductAttention(

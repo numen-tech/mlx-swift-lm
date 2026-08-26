@@ -40,7 +40,7 @@ var fixturesBundle: Bundle { Bundle(for: FixturesBundleToken.self) }
 // SmallTokenizer — all of which live outside the gate — for tests that
 // exercise xgrammar / MLXLMCommon directly.
 
-#if FoundationModelsIntegration
+#if FoundationModelsIntegration && canImport(FoundationModels, _version: 2)
 
 /// Constructs an `MLXLanguageModel` using the production test downloader /
 /// tokenizer loader and a `HubCache.default`-backed `weightsLocation:` closure.
@@ -164,7 +164,7 @@ func makeExecutorRequest(
     schema: GenerationSchema? = nil,
     generationOptions: GenerationOptions = GenerationOptions(),
     contextOptions: ContextOptions = ContextOptions(),
-    metadata: [String: any Sendable & Codable & Equatable] = [:]
+    metadata: [String: any ConvertibleToGeneratedContent & Sendable] = [:]
 ) -> LanguageModelExecutorGenerationRequest {
     LanguageModelExecutorGenerationRequest(
         id: id,
@@ -183,15 +183,16 @@ func makeExecutorRequest(
 /// public `finish()`. In production the framework closes the channel after
 /// respond returns; tests bypass the framework, so iterating the channel
 /// directly hangs forever. We relay events into an `AsyncThrowingStream`
-/// that we own. A producer task runs `respond()`, then cancels a collector
-/// task (which relays channel events into our stream). Our stream's
+/// that we own. A producer task attaches an observer that yields readable
+/// `GenerationEvent`s into our stream, then runs `respond()` and cancels a
+/// collector task that drains and discards the channel's opaque events (just
+/// enough to keep `respond()`'s sends from stalling). Our stream's
 /// continuation is finished once both tasks settle, so `for try await`
-/// terminates naturally. Early break from iteration cancels both tasks via
-/// `deinit`, so tests that stop reading mid-generation don't waste GPU
-/// compute on tokens nobody wants.
+/// terminates naturally. Tests that must prove cancellation can call
+/// `cancelAndWait()`; ordinary early breaks still cancel both tasks via `deinit`.
 @available(iOS 27.0, macOS 27.0, visionOS 27.0, *)
 final class TestResponseStream: AsyncSequence, @unchecked Sendable {
-    typealias Element = LanguageModelExecutorGenerationChannel.Event
+    typealias Element = MLXLanguageModel.Executor.GenerationEvent
     typealias AsyncIterator = AsyncThrowingStream<Element, Error>.AsyncIterator
 
     private let stream: AsyncThrowingStream<Element, Error>
@@ -201,33 +202,52 @@ final class TestResponseStream: AsyncSequence, @unchecked Sendable {
     init(
         executor: MLXLanguageModel.Executor,
         request: LanguageModelExecutorGenerationRequest,
-        model: MLXLanguageModel
+        model: MLXLanguageModel,
+        cancelProducerWhen: (@Sendable (Element) -> Bool)? = nil,
+        guidedGenerationSink: GuidedGenerationDiagnosticSink? = nil
     ) {
         let channel = LanguageModelExecutorGenerationChannel()
         let (stream, continuation) = AsyncThrowingStream<Element, Error>.makeStream()
         self.stream = stream
 
-        // Collector: relay events from the framework channel into our stream.
+        // The SDK's channel events are opaque, so we read generated content via
+        // the executor's observation hook instead. We still must drain the
+        // channel: respond() sends into it, and without a consumer those sends
+        // would stall. The drained events are discarded; content comes from the
+        // observer below.
         let collector = Task<Void, Never> {
             do {
-                for try await event in channel {
-                    continuation.yield(event)
-                }
+                for try await _ in channel {}
             } catch {
                 // Including CancellationError; we don't depend on cancellation here.
             }
         }
         self.collectorTask = collector
 
-        // Producer: run respond(), then finish our stream so the test's
-        // iteration terminates.
+        // Producer: attach the observer (task-local, so it also reaches the
+        // guided-path forwarder child task), run respond(), then finish our
+        // stream so the test's iteration terminates.
         self.producerTask = Task<Void, Never> {
             defer { collector.cancel() }
-            do {
-                try await executor.respond(to: request, model: model, streamingInto: channel)
-                continuation.finish()
-            } catch {
-                continuation.finish(throwing: error)
+            let resolvedGuidedGenerationSink =
+                guidedGenerationSink ?? GuidedGenerationDiagnosticSink.current
+            await GuidedGenerationDiagnosticSink.$current.withValue(
+                resolvedGuidedGenerationSink
+            ) {
+                await MLXLanguageModel.Executor.$generationObserver.withValue({ event in
+                    continuation.yield(event)
+                    if cancelProducerWhen?(event) == true {
+                        withUnsafeCurrentTask { $0?.cancel() }
+                    }
+                }) {
+                    do {
+                        try await executor.respond(
+                            to: request, model: model, streamingInto: channel)
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
             }
         }
     }
@@ -240,6 +260,16 @@ final class TestResponseStream: AsyncSequence, @unchecked Sendable {
     func makeAsyncIterator() -> AsyncIterator {
         stream.makeAsyncIterator()
     }
+
+    /// Cancels an in-flight response and waits until both the producer and its
+    /// channel collector have unwound. The stream continuation is finished by
+    /// the producer with the cancellation error from `respond()`.
+    func cancelAndWait() async {
+        producerTask.cancel()
+        await producerTask.value
+        collectorTask.cancel()
+        await collectorTask.value
+    }
 }
 
 /// Starts executor.respond(...) on a background task and returns a wrapper that
@@ -251,6 +281,38 @@ func executeResponse(
     model: MLXLanguageModel
 ) async throws -> TestResponseStream {
     TestResponseStream(executor: executor, request: request, model: model)
+}
+
+/// Test-only variant that binds guided-generation diagnostics to the producer
+/// task, including its synchronous guided emit closure.
+@available(iOS 27.0, macOS 27.0, visionOS 27.0, *)
+func executeResponse(
+    _ executor: MLXLanguageModel.Executor,
+    request: LanguageModelExecutorGenerationRequest,
+    model: MLXLanguageModel,
+    guidedGenerationSink: GuidedGenerationDiagnosticSink
+) async throws -> TestResponseStream {
+    TestResponseStream(
+        executor: executor,
+        request: request,
+        model: model,
+        guidedGenerationSink: guidedGenerationSink)
+}
+
+/// Test-only variant that synchronously cancels the producer from its event
+/// observer, allowing cancellation tests to avoid racing buffered output.
+@available(iOS 27.0, macOS 27.0, visionOS 27.0, *)
+func executeResponse(
+    _ executor: MLXLanguageModel.Executor,
+    request: LanguageModelExecutorGenerationRequest,
+    model: MLXLanguageModel,
+    cancelProducerWhen: @escaping @Sendable (MLXLanguageModel.Executor.GenerationEvent) -> Bool
+) async throws -> TestResponseStream {
+    TestResponseStream(
+        executor: executor,
+        request: request,
+        model: model,
+        cancelProducerWhen: cancelProducerWhen)
 }
 
 // MARK: - GPU Memory Management
@@ -339,6 +401,17 @@ enum TestFixtures {
         "Generate a 3-day travel itinerary to Mount Fuji with 3 activities per day. Respond as JSON."
 
     static let gemmaModelID = "mlx-community/gemma-3-270m-it-4bit"
+
+    /// Gemma 4 (E2B) instruction-tuned. Its chat template natively renders
+    /// tool calls and `tool` responses, so it exercises the multi-turn
+    /// tool-calling replay path (assistant tool-call + tool result).
+    static let gemma4ModelID = "mlx-community/gemma-4-e2b-it-4bit"
+
+    /// Qwen3 (4B) instruction-tuned. A second model family whose chat template
+    /// renders tool calls and `tool` responses, used alongside `gemma4ModelID`
+    /// to verify the multi-turn tool-calling path is model-agnostic rather than
+    /// tuned to any one template dialect.
+    static let qwen3ModelID = "mlx-community/Qwen3-4B-4bit"
 
     /// Default model ID for tests that don't care which specific MLX model runs,
     /// but do need a model known to exercise the full guided-generation and

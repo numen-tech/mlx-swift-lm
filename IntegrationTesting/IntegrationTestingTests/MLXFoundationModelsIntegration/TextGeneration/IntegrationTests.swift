@@ -1,5 +1,7 @@
 // Copyright © 2025 Apple Inc.
 
+#if FoundationModelsIntegration && canImport(FoundationModels, _version: 2)
+
 import Foundation
 import FoundationModels
 import Testing
@@ -89,31 +91,23 @@ struct IntegrationTests {
             contextOptions: ContextOptions(),
             metadata: [:]
         )
-        let channel = LanguageModelExecutorGenerationChannel()
-        let respondTask = Task {
-            try await executor.respond(to: request, model: model, streamingInto: channel)
-        }
-
-        var events: [LanguageModelExecutorGenerationChannel.Event] = []
-        for try await event in channel {
+        let stream = try await executeResponse(executor, request: request, model: model)
+        var events: [MLXLanguageModel.Executor.GenerationEvent] = []
+        for try await event in stream {
             events.append(event)
             if events.count >= 3 {  // Get a few events
                 break
             }
         }
-        respondTask.cancel()
-        try? await respondTask.value
 
         // First event should be metadata
-        guard let response = events.first as? LanguageModelExecutorGenerationChannel.Response,
-            case .updateMetadata(let metadata) = response.action
-        else {
+        guard case .updateMetadata(let metadata, _) = events.first else {
             Issue.record("First event should be metadataUpdate")
             return
         }
 
         #expect(
-            metadata.values["modelID"] != nil,
+            metadata["modelID"] != nil,
             "Metadata should contain model identifier"
         )
     }
@@ -306,16 +300,11 @@ struct IntegrationTests {
             contextOptions: ContextOptions(),
             metadata: [:]
         )
-        let channel = LanguageModelExecutorGenerationChannel()
-        let respondTask = Task {
-            try await executor.respond(to: request, model: model, streamingInto: channel)
-        }
+        let stream = try await executeResponse(executor, request: request, model: model)
 
         var tokenCount = 0
-        for try await event in channel {
-            if let response = event as? LanguageModelExecutorGenerationChannel.Response,
-                case .appendText = response.action
-            {
+        for try await event in stream {
+            if case .appendText(_, _, .response) = event {
                 tokenCount += 1
             }
             // Cancel early after a few tokens
@@ -323,9 +312,9 @@ struct IntegrationTests {
                 break
             }
         }
-        // Cancel the respond task since we broke out early
-        respondTask.cancel()
 
         #expect(tokenCount >= 5, "Should have received at least 5 tokens before cancellation")
     }
 }
+
+#endif  // FoundationModelsIntegration

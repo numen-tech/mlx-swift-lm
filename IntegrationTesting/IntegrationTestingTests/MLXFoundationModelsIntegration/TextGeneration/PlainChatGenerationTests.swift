@@ -1,6 +1,6 @@
 // Copyright © 2026 Apple Inc.
 
-#if FoundationModelsIntegration
+#if FoundationModelsIntegration && canImport(FoundationModels, _version: 2)
 
 import Testing
 import Foundation
@@ -37,9 +37,7 @@ struct PlainChatGenerationTests {
         let stream = try await executeResponse(executor, request: request, model: model)
         var sawTextDelta = false
         for try await event in stream {
-            if let response = event as? LanguageModelExecutorGenerationChannel.Response,
-                case .appendText = response.action
-            {
+            if case .appendText(_, _, .response) = event {
                 sawTextDelta = true
             }
         }

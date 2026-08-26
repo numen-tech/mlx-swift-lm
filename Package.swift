@@ -1,4 +1,4 @@
-// swift-tools-version: 6.1
+// swift-tools-version: 6.2
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import CompilerPluginSupport
@@ -25,6 +25,9 @@ let package = Package(
         .library(
             name: "MLXEmbedders",
             targets: ["MLXEmbedders"]),
+        .library(
+            name: "MLXRerankers",
+            targets: ["MLXRerankers"]),
         .library(
             name: "MLXHuggingFace",
             targets: ["MLXHuggingFace"]),
@@ -116,6 +119,15 @@ let package = Package(
             ]
         ),
         .target(
+            name: "MLXRerankers",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXEmbedders",
+            ],
+            path: "Libraries/MLXRerankers"
+        ),
+        .target(
             name: "BenchmarkHelpers",
             dependencies: [
                 "MLXLMCommon",
@@ -133,6 +145,7 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXRerankers",
                 .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Libraries/IntegrationTestHelpers",
@@ -148,6 +161,7 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXRerankers",
             ],
             path: "Tests/MLXLMTests",
             exclude: [
@@ -224,7 +238,9 @@ let package = Package(
                 .unsafeFlags(["-w"], .when(platforms: [.macOS, .iOS, .visionOS, .tvOS])),
             ],
             linkerSettings: [
-                .linkedLibrary("c++")
+                // Apple platforms only: on Linux the Swift toolchain links libstdc++,
+                // and there is no libc++ to link against.
+                .linkedLibrary("c++", .when(platforms: [.macOS, .iOS, .visionOS, .tvOS]))
             ]
         ),
         // Grammar-constrained ("guided") generation engine built on the

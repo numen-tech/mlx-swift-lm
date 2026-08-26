@@ -1,6 +1,6 @@
 // Copyright © 2025 Apple Inc.
 
-#if FoundationModelsIntegration
+#if FoundationModelsIntegration && canImport(FoundationModels, _version: 2)
 
 import Testing
 import Foundation
@@ -402,10 +402,8 @@ struct MultiModelGuidedGenerationTests {
         let stream = try await executeResponse(executor, request: request, model: model)
         var text = ""
         for try await event in stream {
-            if let response = event as? LanguageModelExecutorGenerationChannel.Response,
-                case .appendText(let delta) = response.action
-            {
-                text += delta.content
+            if case .appendText(let chunk, _, .response) = event {
+                text += chunk
             }
         }
         return text

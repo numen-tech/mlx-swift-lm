@@ -15,7 +15,7 @@
 // Suite is `.serialized` and gated on both traits because the schema/
 // tool-calling tests load `ModelContainer` and require xgrammar.
 
-#if FoundationModelsIntegration
+#if FoundationModelsIntegration && canImport(FoundationModels, _version: 2)
 
 import Testing
 import Foundation
@@ -135,10 +135,8 @@ private func collectFinalUsage(
 ) async throws -> (input: Int, output: Int) {
     var lastUsage: (input: Int, output: Int)?
     for try await event in stream {
-        if let response = event as? LanguageModelExecutorGenerationChannel.Response,
-            case .updateUsage(let usage) = response.action
-        {
-            lastUsage = (usage.input.totalTokenCount, usage.output.totalTokenCount)
+        if case .updateUsage(let input, let output, _) = event {
+            lastUsage = (input.totalTokenCount, output.totalTokenCount)
         }
     }
     return try #require(

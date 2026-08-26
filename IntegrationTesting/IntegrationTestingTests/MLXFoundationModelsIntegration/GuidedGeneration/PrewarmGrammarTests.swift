@@ -1,6 +1,6 @@
 // Copyright © 2025 Apple Inc.
 
-#if FoundationModelsIntegration
+#if FoundationModelsIntegration && canImport(FoundationModels, _version: 2)
 
 import Testing
 import Foundation
@@ -45,9 +45,7 @@ struct PrewarmGrammarTests {
 
         var hasText = false
         for try await event in stream {
-            if let response = event as? LanguageModelExecutorGenerationChannel.Response,
-                case .appendText = response.action
-            {
+            if case .appendText(_, _, .response) = event {
                 hasText = true
                 break
             }
@@ -78,9 +76,7 @@ struct PrewarmGrammarTests {
 
         var hasText = false
         for try await event in stream {
-            if let response = event as? LanguageModelExecutorGenerationChannel.Response,
-                case .appendText = response.action
-            {
+            if case .appendText(_, _, .response) = event {
                 hasText = true
                 break
             }

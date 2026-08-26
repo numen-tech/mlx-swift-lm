@@ -1,6 +1,6 @@
 // Copyright © 2025 Apple Inc.
 
-#if FoundationModelsIntegration
+#if FoundationModelsIntegration && canImport(FoundationModels, _version: 2)
 
 import Testing
 import Foundation
@@ -427,7 +427,7 @@ struct GuidedGenerationBenchmarkTests {
                 case .chunk(let text):
                     charCount += text.count
                     deltaCount += 1
-                case .info, .toolCall:
+                case .info, .toolCall, .rejectedToolCall:
                     break
                 }
             }
