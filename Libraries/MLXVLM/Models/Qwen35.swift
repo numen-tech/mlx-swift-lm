@@ -1407,6 +1407,26 @@ public class Qwen35: Module, VLMModel {
         languageModel.model.embedTokens(ids)
     }
 
+    /// The continuation state `prepare` would have handed back after a text-only prefill or
+    /// continuation on this model: the M-RoPE delta relative to the cache offset, which is
+    /// zero for every text-only sequence (`getRopeIndex` only accumulates a non-zero delta
+    /// across image/video runs).
+    ///
+    /// For a host that advanced a warm KV cache through `backboneHidden` (which positions
+    /// tokens at `faCacheOffset(cache)` directly and never produces a state), or that
+    /// restored a text-only cache without its state. Upstream's `prepare` /
+    /// `callAsFunction` fail closed on a warm cache without this state (they cannot tell
+    /// whether the cached prefix held images); a host that *does* know the prefix is
+    /// text-only supplies this state to continue instead of rebuilding the cache cold.
+    /// Passing it for a cache whose prefix held images would silently mis-position the
+    /// remainder — exactly what the fail-closed check exists to prevent — so only use it
+    /// for caches the host built from text alone.
+    public func textOnlyContinuationState(batchSize: Int = 1) -> LMOutput.State {
+        var state = LMOutput.State()
+        state[ropeDeltasKey] = MLXArray(Array(repeating: Int32(0), count: batchSize))
+        return state
+    }
+
     public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
         MLXArray]
     {

@@ -283,14 +283,14 @@ final class Qwen35ContinuationTests: XCTestCase {
         let full = concatenated([t1, t2], axis: 1)
 
         // Reference: one cold prefill of the whole sequence.
-        let cacheF = model.newCache(parameters: nil)
+        let cacheF = try model.newCache(parameters: nil)
         let (logitsF, _) = try lastLogits(
             model.prepare(
                 LMInput(text: .init(tokens: full)), cache: cacheF, state: nil, windowSize: nil))
 
         // Control: decode path, token by token, state threaded. Correct by
         // construction; its divergence from F is the numerical noise floor.
-        let cacheD = model.newCache(parameters: nil)
+        let cacheD = try model.newCache(parameters: nil)
         let (_, s0) = try lastLogits(
             model.prepare(
                 LMInput(text: .init(tokens: t1)), cache: cacheD, state: nil, windowSize: nil))
@@ -306,7 +306,7 @@ final class Qwen35ContinuationTests: XCTestCase {
 
         // `backboneHidden` against a warm cache — the seam's own call
         // pattern: no carried state, repeated calls into one growing cache.
-        let cacheB = model.newCache(parameters: nil)
+        let cacheB = try model.newCache(parameters: nil)
         _ = try lastLogits(
             model.prepare(
                 LMInput(text: .init(tokens: t1)), cache: cacheB, state: nil, windowSize: nil))
@@ -318,6 +318,58 @@ final class Qwen35ContinuationTests: XCTestCase {
             drift, max(noiseFloor * 10, 1e-3),
             "backboneHidden on a warm cache diverged from full prefill (noise floor \(noiseFloor))"
         )
+    }
+
+    /// A cache advanced only through `backboneHidden` carries no state, so `prepare`
+    /// refuses to continue it. `textOnlyContinuationState()` is the state `prepare` would
+    /// have produced for that text-only prefix: continuing with it must match both the
+    /// state-threaded continuation and a one-shot full prefill.
+    func testTextOnlyContinuationStateResumesSeamAdvancedCache() throws {
+        MLXRandom.seed(23)
+        let model = try makeTinyModel()
+        let t1 = textTokens(40)
+        let t2 = textTokens(8, seed: 3)
+        let full = concatenated([t1, t2], axis: 1)
+
+        let cacheF = try model.newCache(parameters: nil)
+        let (logitsF, _) = try lastLogits(
+            model.prepare(
+                LMInput(text: .init(tokens: full)), cache: cacheF, state: nil, prefill: .init()))
+
+        // Control: `prepare`'s own state, threaded.
+        let cacheP = try model.newCache(parameters: nil)
+        let (_, prepared) = try lastLogits(
+            model.prepare(
+                LMInput(text: .init(tokens: t1)), cache: cacheP, state: nil, prefill: .init()))
+        let (logitsP, _) = try lastLogits(
+            model.prepare(
+                LMInput(text: .init(tokens: t2)), cache: cacheP, state: prepared,
+                prefill: .init()))
+
+        // Seam-advanced cache: no state exists; the synthesized one must stand in for it.
+        let cacheB = try model.newCache(parameters: nil)
+        _ = model.backboneHidden(t1, cache: cacheB)
+        XCTAssertThrowsError(
+            try model.prepare(
+                LMInput(text: .init(tokens: t2)), cache: cacheB, state: nil, prefill: .init()),
+            "a seam-advanced warm cache still fails closed without state")
+        let (logitsB, resumed) = try lastLogits(
+            model.prepare(
+                LMInput(text: .init(tokens: t2)), cache: cacheB,
+                state: model.textOnlyContinuationState(), prefill: .init()))
+
+        XCTAssertLessThanOrEqual(
+            maxAbsDiff(logitsB, logitsP), 1e-5,
+            "synthesized text-only state must continue exactly like prepare's own state")
+        XCTAssertLessThanOrEqual(
+            maxAbsDiff(logitsB, logitsF), 1e-3,
+            "seam-advanced cache + synthesized state diverged from full prefill")
+        XCTAssertNotNil(resumed, "continuing with the synthesized state must yield a resume state")
+        // The resume state must itself continue the cache (decode-loop contract).
+        XCTAssertNoThrow(
+            try model.prepare(
+                LMInput(text: .init(tokens: textTokens(3, seed: 5))), cache: cacheB,
+                state: resumed, prefill: .init()))
     }
 
     /// Windowed (chunked) prefill must produce the same first-token logits as
