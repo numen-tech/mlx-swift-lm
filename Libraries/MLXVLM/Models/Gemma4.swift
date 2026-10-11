@@ -1224,7 +1224,6 @@ final class Gemma4TextBackbone: Module {
         }
         let finalPerLayerInputs = projectPerLayerInputs(h0, perLayerInputs: processedPerLayerInputs)
 
-        let hasExplicitCache = cache != nil
         let localCache =
             cache ?? Array(repeating: nil as KVCache?, count: max(firstKVSharedLayerIdx, 1))
         var fullMask: MLXFast.ScaledDotProductAttentionMaskMode
@@ -1426,7 +1425,7 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         let softcappedLogits: MLXArray
         if let finalLogitSoftcapping, finalLogitSoftcapping > 0 {
             let scale = MLXArray(finalLogitSoftcapping)
-            softcappedLogits = tanh(logits / scale) * scale
+            softcappedLogits = gemma4LogitSoftcap(logits, scale)
         } else {
             softcappedLogits = logits
         }
@@ -2687,15 +2686,7 @@ public struct Gemma4MessageGenerator: MessageGenerator {
         } else {
             dictionary = [
                 "role": message.role.rawValue,
-                "content": message.images.map { _ in
-                    ["type": "image"]
-                }
-                    + message.videos.map { _ in
-                        ["type": "video"]
-                    }
-                    + [
-                        ["type": "text", "text": message.content]
-                    ],
+                "content": contentParts(for: message, layout: .imagesThenVideosThenText),
             ]
         }
         addToolMetadata(to: &dictionary, for: message)
@@ -2754,14 +2745,15 @@ public struct Gemma4Processor: UserInputProcessor {
             ) { frame in
                 var userProcessing = processing ?? UserInput.Processing()
                 userProcessing.resize = targetSize
-                var image = MediaProcessing.apply(frame.frame, processing: userProcessing)
+                var image = MediaProcessing.apply(
+                    try frame.image.asCIImage(), processing: userProcessing)
                 image = MediaProcessing.inSRGBToneCurveSpace(image)
                 image = MediaProcessing.resampleBicubic(image, to: targetSize)
                 if config.doNormalize {
                     image = MediaProcessing.normalize(
                         image, mean: config.imageMeanTuple, std: config.imageStdTuple)
                 }
-                return VideoFrame(frame: image, timeStamp: frame.timeStamp)
+                return VideoFrame(image: .ciImage(image), timeStamp: frame.timeStamp)
             }
             allFrames.append(contentsOf: sequence.frames)
             frameCounts.append(sequence.frames.count)
@@ -2770,7 +2762,8 @@ public struct Gemma4Processor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Gemma4MessageGenerator().generate(from: input)
+        let messages = Gemma4MessageGenerator().generate(
+            from: input.removingSpecialTokenLabels(using: tokenizer))
 
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
@@ -3329,7 +3322,8 @@ public struct Gemma4UnifiedProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Gemma4MessageGenerator().generate(from: input)
+        let messages = Gemma4MessageGenerator().generate(
+            from: input.removingSpecialTokenLabels(using: tokenizer))
 
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,

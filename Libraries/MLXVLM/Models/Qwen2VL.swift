@@ -124,7 +124,7 @@ private enum Language {
             var freqs = matmul(invFreqExpanded, posExpanded)  // [3, batch, dim/2, seq]
             freqs = freqs.transposed(0, 1, 3, 2)  // [3, batch, seq, dim/2]
 
-            var freqsT = freqs[0]
+            let freqsT = freqs[0]
             var offset = mropeSectionRaw[0]
             for dim in 1 ..< mropeSectionRaw.count {
                 let length = mropeSectionRaw[dim]
@@ -833,7 +833,8 @@ public struct Qwen2VLProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Qwen2VLMessageGenerator().generate(from: input)
+        let messages = Qwen2VLMessageGenerator().generate(
+            from: input.removingSpecialTokenLabels(using: tokenizer))
 
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
@@ -1288,10 +1289,7 @@ public struct Qwen2VLMessageGenerator: MessageGenerator {
         // a deterministic ~9 px bbox offset vs the Python mlx-vlm reference.
         var dictionary: MLXLMCommon.Message = [
             "role": message.role.rawValue,
-            "content":
-                message.images.map { _ in ["type": "image"] }
-                + message.videos.map { _ in ["type": "video"] }
-                + [["type": "text", "text": message.content]],
+            "content": contentParts(for: message, layout: .imagesThenVideosThenText),
         ]
         addToolMetadata(to: &dictionary, for: message)
         return dictionary
