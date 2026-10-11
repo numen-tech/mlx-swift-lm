@@ -10,6 +10,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 import MLXVLM
 import XCTest
 
@@ -377,6 +378,34 @@ final class Qwen35ContinuationTests: XCTestCase {
             try model.prepare(
                 LMInput(text: .init(tokens: textTokens(3, seed: 5))), cache: cacheB,
                 state: resumed, prefill: .init()))
+    }
+
+    /// Review Focus 3: speculative verify reads every position, so `backboneHidden` must never
+    /// take #614's `lastTokenOnly` trim. 130 tokens on a 4-bit projection is a length #614 trims.
+    func testBackboneHiddenReturnsEveryPositionOfQuantizedProjectionPrompt() throws {
+        try withRandomState(MLXRandom.RandomState(seed: 29)) {
+            let model = try makeTinyModel()
+            quantize(model: model, groupSize: 32, bits: 4)
+            eval(model)
+            let count = 130
+            let tokens = textTokens(count)
+
+            let hidden = model.backboneHidden(tokens, cache: try model.newCache(parameters: nil))
+            XCTAssertEqual(
+                hidden.dim(1), count,
+                "the speculative seam must return every position, not #614's trimmed tail")
+
+            // Row-aligned with the regular (untrimmed) forward.
+            let expected = model(
+                LMInput.Text(tokens: tokens), cache: try model.newCache(parameters: nil),
+                state: nil
+            ).logits
+            let actual = model.backboneLogits(fromHidden: hidden)
+            guard actual.shape == expected.shape else {
+                return XCTFail("seam logits \(actual.shape) vs forward \(expected.shape)")
+            }
+            XCTAssertLessThanOrEqual(maxAbsDiff(actual, expected), 1e-5)
+        }
     }
 
     /// Windowed (chunked) prefill must produce the same first-token logits as
