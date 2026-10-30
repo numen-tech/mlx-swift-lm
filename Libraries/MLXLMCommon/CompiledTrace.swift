@@ -10,52 +10,19 @@ import MLXNN
 // never notices. An adapter load, fuse, or unload, or a training step, keeps
 // producing the old weights.
 //
-// The `compile` overloads below shadow MLX's stateless ones with a `@Sendable`
-// body. `MLXArray` and `Module` are not `Sendable`, so that capture no longer
-// builds. Bodies that read weights use `CompiledTrace`, which declares them as
-// compile state.
+// MLX's stateless `compile` overloads with a `@Sendable` body (here, and in
+// `CompileOverloads.swift` for the wider shapes) cannot capture an `MLXArray` or
+// a `Module`, because neither is `Sendable`. Bodies that read weights use
+// `CompiledTrace`, which declares them as compile state.
 //
 // `MLX.compile(inputs:outputs:)` is untouched: declaring captured state there
 // is correct, and it remains the way to compile a training step.
 
-/// Compiles a function that reads nothing but its arguments.
-///
-/// Shadows MLX's `compile` with a `@Sendable` body, which cannot capture an
-/// `MLXArray` or a `Module`. Use ``CompiledTrace`` for a body that has to read
-/// module weights.
-public func compile(
-    shapeless: Bool = false,
-    _ body: @escaping @Sendable ([MLXArray]) -> [MLXArray]
-) -> @Sendable ([MLXArray]) -> [MLXArray] {
-    MLX.compile(shapeless: shapeless, body)
-}
-
-/// Overload of ``compile(shapeless:_:)-(Bool,([MLXArray])->[MLXArray])`` for one input and one
-/// output.
-public func compile(
-    shapeless: Bool = false,
-    _ body: @escaping @Sendable (MLXArray) -> MLXArray
-) -> @Sendable (MLXArray) -> MLXArray {
-    MLX.compile(shapeless: shapeless, body)
-}
-
-/// Overload of ``compile(shapeless:_:)-(Bool,([MLXArray])->[MLXArray])`` for two inputs and one
-/// output.
-public func compile(
-    shapeless: Bool = false,
-    _ body: @escaping @Sendable (MLXArray, MLXArray) -> MLXArray
-) -> @Sendable (MLXArray, MLXArray) -> MLXArray {
-    MLX.compile(shapeless: shapeless, body)
-}
-
-/// Overload of ``compile(shapeless:_:)-(Bool,([MLXArray])->[MLXArray])`` for three inputs and one
-/// output.
-public func compile(
-    shapeless: Bool = false,
-    _ body: @escaping @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray
-) -> @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray {
-    MLX.compile(shapeless: shapeless, body)
-}
+// mlx-swift 0.33 ships the same `@Sendable` stateless overloads (the array form and one,
+// two and three inputs with one result) next to the unchecked ones, so the copies this
+// package used to shadow MLX with are gone: they would be ambiguous with MLX's. Callers
+// annotate the closure `@Sendable` to pick the checked overload. The wider shapes
+// (`CompileOverloads.swift`) have no MLX twin and stay.
 
 /// A compiled trace of a body that reads module weights.
 ///
@@ -159,9 +126,17 @@ public final class CompiledTrace<Owner: Module>: CompiledTraceInvalidating {
         // The one place in this package that captures a module in a compiled
         // body: `unowned` because the module stores the trace, and a strong
         // capture would cycle and leak the weights with it.
-        return MLX.compile(inputs: [weights]) { [unowned owner] arguments in
+        //
+        // mlx-swift 0.33 returns a non-Sendable closure from the stateful
+        // `compile(inputs:)` overloads (only the Sendable-capture ones return a
+        // Sendable one). Calls are serialized by MLX's own evalLock, and this
+        // type hands the closure out only through `callAsFunction`, so the
+        // closure is boxed as Sendable here.
+        nonisolated(unsafe) let compiled = MLX.compile(inputs: [weights]) {
+            [unowned owner] arguments in
             body(owner, arguments)
         }
+        return { arguments in compiled(arguments) }
     }
 }
 
