@@ -1,7 +1,7 @@
 import MLX
 
 private let compiledGemma4Softcap = compile(shapeless: true) {
-    (logits: MLXArray, cap: MLXArray) in tanh(logits / cap) * cap
+    @Sendable (logits: MLXArray, cap: MLXArray) in tanh(logits / cap) * cap
 }
 
 package func gemma4LogitSoftcap(_ logits: MLXArray, _ cap: Float) -> MLXArray {
