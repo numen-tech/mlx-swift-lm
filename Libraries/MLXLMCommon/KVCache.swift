@@ -1640,6 +1640,103 @@ public class MambaCache: ArraysCache {
         copyContents(to: new)
         return new
     }
+
+    // MARK: Rollback recording (speculative verify)
+
+    /// Rebuilds the state after the first `rows` rows of the recorded pass. `base` is the cache's
+    /// `[conv, recurrent]` slots as they were before the pass; the result is the same two slots
+    /// for the shorter prefix.
+    public typealias RollbackRebuild = (_ base: [MLXArray?], _ rows: Int) -> [MLXArray?]
+
+    private struct RollbackBase {
+        var state: [MLXArray?]
+        var offset: Int
+        var leftPadding: MLXArray?
+        var lengths: MLXArray?
+    }
+
+    private struct RollbackRecord {
+        var rows: Int
+        var rebuild: RollbackRebuild
+    }
+
+    private var rollbackBase: RollbackBase?
+    private var rollbackRecord: RollbackRecord?
+    private var rollbackInvalid = false
+
+    /// Hold the current state as the base of a speculative verify pass and ask the layer that
+    /// advances this cache to record what it needs to rebuild the state after any shorter prefix
+    /// of that pass (`recordRollback`). Nothing is copied: the layers replace the slots instead of
+    /// mutating them, so the base stays valid by reference. Replaces an earlier recording.
+    public func beginRollbackRecording() {
+        rollbackBase = RollbackBase(
+            state: cache, offset: offset, leftPadding: leftPadding, lengths: lengths)
+        rollbackRecord = nil
+        rollbackInvalid = false
+    }
+
+    public var isRecordingRollback: Bool { rollbackBase != nil }
+
+    /// Called by the layer that advanced this cache over `rows` rows while recording. A second
+    /// pass before `commit`/`discard` makes the record unusable (the base no longer precedes it).
+    public func recordRollback(rows: Int, rebuild: @escaping RollbackRebuild) {
+        guard rollbackBase != nil else { return }
+        if rollbackRecord != nil {
+            rollbackInvalid = true
+            return
+        }
+        rollbackRecord = RollbackRecord(rows: rows, rebuild: rebuild)
+    }
+
+    /// Called by the layer when it advanced this cache while recording but could not record
+    /// (a masked pass, a single row): `commitRollback` then refuses and the caller falls back.
+    public func invalidateRollback() {
+        if rollbackBase != nil { rollbackInvalid = true }
+    }
+
+    /// Whether `commitRollback(keepingRows:)` would succeed.
+    public func canCommitRollback(keepingRows kept: Int) -> Bool {
+        guard rollbackBase != nil, !rollbackInvalid, let record = rollbackRecord else { return false }
+        return kept >= 1 && kept <= record.rows
+    }
+
+    /// Make the state the one after the first `kept` rows of the recorded pass (`1 ... rows`) and
+    /// end the recording. `kept == rows` keeps the pass's own final state. Returns false, leaving
+    /// the recording in place, when there is nothing usable to commit.
+    @discardableResult
+    public func commitRollback(keepingRows kept: Int) -> Bool {
+        guard canCommitRollback(keepingRows: kept), let base = rollbackBase,
+            let record = rollbackRecord
+        else { return false }
+        if kept < record.rows {
+            cache = record.rebuild(base.state, kept)
+            offset = base.offset
+            leftPadding = base.leftPadding.map { $0 - kept }
+            lengths = base.lengths.map { $0 - kept }
+        }
+        discardRollback()
+        return true
+    }
+
+    /// Return to the state before the recorded pass (the fallback when a commit is refused) and
+    /// end the recording. Returns false when nothing was being recorded.
+    @discardableResult
+    public func restoreRollbackBase() -> Bool {
+        guard let base = rollbackBase else { return false }
+        cache = base.state
+        offset = base.offset
+        leftPadding = base.leftPadding
+        lengths = base.lengths
+        discardRollback()
+        return true
+    }
+
+    /// End the recording, keeping the cache as the pass left it.
+    public func discardRollback() {
+        rollbackBase = nil
+        rollbackRecord = nil
+        rollbackInvalid = false
+    }
 }
 
 /// Composite cache that manages multiple sub-caches
