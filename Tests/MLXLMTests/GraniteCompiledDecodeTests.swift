@@ -18,7 +18,7 @@ final class GraniteCompiledDecodeTests: XCTestCase {
     private func configuration(layers: Int = 3) throws -> GraniteConfiguration {
         let json = """
             {
-                "hidden_size": 64, "num_hidden_layers": \(layers), "intermediate_size": 128,
+                "hidden_size": 128, "num_hidden_layers": \(layers), "intermediate_size": 256,
                 "num_attention_heads": 4, "num_key_value_heads": 2,
                 "rms_norm_eps": 1e-5, "vocab_size": 64,
                 "logits_scaling": 4.0, "attention_multiplier": 0.125,
@@ -39,6 +39,8 @@ final class GraniteCompiledDecodeTests: XCTestCase {
             let model = GraniteModel(configuration)
             model.update(parameters: model.parameters().mapValues { $0.asType(dtype) })
             eval(model)
+            // A `ModelContext` does this for every loaded model; the compiled step is eval-only.
+            model.train(false)
             return model
         }
     }
