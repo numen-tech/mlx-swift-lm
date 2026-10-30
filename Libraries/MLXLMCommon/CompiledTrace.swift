@@ -159,9 +159,17 @@ public final class CompiledTrace<Owner: Module>: CompiledTraceInvalidating {
         // The one place in this package that captures a module in a compiled
         // body: `unowned` because the module stores the trace, and a strong
         // capture would cycle and leak the weights with it.
-        return MLX.compile(inputs: [weights]) { [unowned owner] arguments in
+        //
+        // mlx-swift 0.33 returns a non-Sendable closure from the stateful
+        // `compile(inputs:)` overloads (only the Sendable-capture ones return a
+        // Sendable one). Calls are serialized by MLX's own evalLock, and this
+        // type hands the closure out only through `callAsFunction`, so the
+        // closure is boxed as Sendable here.
+        nonisolated(unsafe) let compiled = MLX.compile(inputs: [weights]) {
+            [unowned owner] arguments in
             body(owner, arguments)
         }
+        return { arguments in compiled(arguments) }
     }
 }
 
