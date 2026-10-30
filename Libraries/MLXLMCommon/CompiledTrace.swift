@@ -10,10 +10,10 @@ import MLXNN
 // never notices. An adapter load, fuse, or unload, or a training step, keeps
 // producing the old weights.
 //
-// The `compile` overloads below shadow MLX's stateless ones with a `@Sendable`
-// body. `MLXArray` and `Module` are not `Sendable`, so that capture no longer
-// builds. Bodies that read weights use `CompiledTrace`, which declares them as
-// compile state.
+// MLX's stateless `compile` overloads with a `@Sendable` body (here, and in
+// `CompileOverloads.swift` for the wider shapes) cannot capture an `MLXArray` or
+// a `Module`, because neither is `Sendable`. Bodies that read weights use
+// `CompiledTrace`, which declares them as compile state.
 //
 // `MLX.compile(inputs:outputs:)` is untouched: declaring captured state there
 // is correct, and it remains the way to compile a training step.
