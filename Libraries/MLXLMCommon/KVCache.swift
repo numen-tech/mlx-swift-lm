@@ -1663,6 +1663,14 @@ public class MambaCache: ArraysCache {
     private var rollbackBase: RollbackBase?
     private var rollbackRecord: RollbackRecord?
     private var rollbackInvalid = false
+    /// Passes that advanced this cache since `beginRollbackRecording` (`advance` runs once per
+    /// pass, on every route that moves the state, including the ones that cannot record).
+    private var rollbackPasses = 0
+
+    public override func advance(_ N: Int) {
+        super.advance(N)
+        if rollbackBase != nil { rollbackPasses += 1 }
+    }
 
     /// Hold the current state as the base of a speculative verify pass and ask the layer that
     /// advances this cache to record what it needs to rebuild the state after any shorter prefix
@@ -1673,6 +1681,7 @@ public class MambaCache: ArraysCache {
             state: cache, offset: offset, leftPadding: leftPadding, lengths: lengths)
         rollbackRecord = nil
         rollbackInvalid = false
+        rollbackPasses = 0
     }
 
     public var isRecordingRollback: Bool { rollbackBase != nil }
@@ -1694,9 +1703,13 @@ public class MambaCache: ArraysCache {
         if rollbackBase != nil { rollbackInvalid = true }
     }
 
-    /// Whether `commitRollback(keepingRows:)` would succeed.
+    /// Whether `commitRollback(keepingRows:)` would succeed: exactly the one recorded pass moved
+    /// the state since the base was taken (any other pass, recordable or not, means the record no
+    /// longer describes it).
     public func canCommitRollback(keepingRows kept: Int) -> Bool {
-        guard rollbackBase != nil, !rollbackInvalid, let record = rollbackRecord else { return false }
+        guard rollbackBase != nil, !rollbackInvalid, rollbackPasses <= 1,
+            let record = rollbackRecord
+        else { return false }
         return kept >= 1 && kept <= record.rows
     }
 
@@ -1736,6 +1749,7 @@ public class MambaCache: ArraysCache {
         rollbackBase = nil
         rollbackRecord = nil
         rollbackInvalid = false
+        rollbackPasses = 0
     }
 }
 
