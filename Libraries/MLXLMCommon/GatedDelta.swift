@@ -337,6 +337,13 @@ func gatedDeltaOps(
 
 // MARK: - Public API
 
+/// The decay gate `g` and write strength `beta` of a GDN layer, in fp32.
+public func gatedDeltaGates(
+    a: MLXArray, b: MLXArray, aLog: MLXArray, dtBias: MLXArray
+) -> (g: MLXArray, beta: MLXArray) {
+    (computeGatedDeltaG(aLog, a, dtBias), sigmoid(b).asType(.float32))
+}
+
 public func gatedDeltaUpdate(
     q: MLXArray,
     k: MLXArray,
@@ -349,9 +356,22 @@ public func gatedDeltaUpdate(
     mask: MLXArray? = nil,
     useKernel: Bool = true
 ) -> (MLXArray, MLXArray) {
-    let beta = sigmoid(b).asType(.float32)
-    let g = computeGatedDeltaG(aLog, a, dtBias)
+    let (g, beta) = gatedDeltaGates(a: a, b: b, aLog: aLog, dtBias: dtBias)
+    return gatedDeltaUpdate(
+        q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask, useKernel: useKernel)
+}
 
+/// `gatedDeltaUpdate` from precomputed gates (`gatedDeltaGates`).
+public func gatedDeltaUpdate(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    g: MLXArray,
+    beta: MLXArray,
+    state: MLXArray? = nil,
+    mask: MLXArray? = nil,
+    useKernel: Bool = true
+) -> (MLXArray, MLXArray) {
     let B = q.dim(0)
     let Dk = q.dim(3)
     let Hv = v.dim(2)
@@ -380,4 +400,21 @@ public func gatedDeltaUpdate(
     }
 
     return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+}
+
+/// The state after `k.dim(1)` rows from `state`, without the outputs: what a rollback to a
+/// shorter prefix needs. Runs the same kernel (or ops fallback) over the same recorded inputs as
+/// the original pass, so row `t`'s state does not depend on how many rows follow it. `q` is not
+/// an input of the state update; the kernel's API still takes one, so `k` stands in.
+public func gatedDeltaReplayState(
+    k: MLXArray,
+    v: MLXArray,
+    g: MLXArray,
+    beta: MLXArray,
+    state: MLXArray?,
+    useKernel: Bool = true
+) -> MLXArray {
+    gatedDeltaUpdate(
+        q: k, k: k, v: v, g: g, beta: beta, state: state, mask: nil, useKernel: useKernel
+    ).1
 }
