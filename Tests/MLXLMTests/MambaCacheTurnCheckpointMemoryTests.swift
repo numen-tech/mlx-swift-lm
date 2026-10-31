@@ -46,7 +46,13 @@ final class MambaCacheTurnCheckpointMemoryTests: XCTestCase {
             recurrent: MLXArray.zeros([1, 2, 4, 4], dtype: .float32), advancedBy: 1)
         eval(cache.turnCheckpoint!.arrays)
 
-        let retained = activeBytes() - base
+        // Metal releases a finished command buffer's inputs on its completion thread, a moment
+        // after `eval` returns: poll for the settled figure instead of reading it once.
+        var retained = activeBytes() - base
+        for _ in 0 ..< 40 where retained >= chunkBytes / 8 {
+            Thread.sleep(forTimeInterval: 0.05)
+            retained = activeBytes() - base
+        }
         XCTAssertLessThan(
             retained, chunkBytes / 8,
             "the checkpoint pins \(retained) bytes; its window is \(cache.turnCheckpoint!.byteCount)"

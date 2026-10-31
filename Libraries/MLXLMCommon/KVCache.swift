@@ -1690,7 +1690,12 @@ public class MambaCache: ArraysCache {
             let conv = cache[0], let recurrent = cache[1]
         else { return false }
         turnCheckpoint = nil
-        let window = conv.contiguous()
+        // The window of a batch-1 prefill is a tail slice of the step's concatenated input, and
+        // a long-lived checkpoint must not pin that whole chunk. `contiguous()` copies only if
+        // necessary (it does copy such a slice in MLX 0.33, measured by
+        // MambaCacheTurnCheckpointMemoryTests, but that is MLX's choice, not a contract). An
+        // elementwise op always writes a new buffer of exactly the window's size.
+        let window = conv * MLXArray(1, dtype: conv.dtype)
         eval(window, recurrent)
         turnCheckpoint = TurnCheckpoint(tokenOffset: tokenOffset, state: [window, recurrent])
         return true
