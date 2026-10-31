@@ -690,17 +690,15 @@ public enum Qwen35Language {
                 }
             }
             if let cache {
-                if convKernelSize > 1 {
-                    cache[0] = result.convState
-                }
-                cache[1] = result.recurrentState
                 if let checkpoint = result.checkpoint, let checkpointAfter {
                     cache.saveSpeculativeCheckpoint(
                         convState: checkpoint.conv,
                         recurrentState: checkpoint.recurrent,
                         advancedBy: checkpointAfter)
                 }
-                cache.advance(inputs.dim(1))
+                cache.replaceState(
+                    conv: convKernelSize > 1 ? result.convState : nil,
+                    recurrent: result.recurrentState, advancedBy: inputs.dim(1))
             }
             return result.output
         }
@@ -1050,9 +1048,7 @@ public enum Qwen35Language {
 
         private func decodeLinearLayer(_ x: MLXArray, cache: MambaCache) -> MLXArray {
             let outputs = compiledLinearLayer(self, [x, cache[0]!, cache[1]!])
-            cache[0] = outputs[1]
-            cache[1] = outputs[2]
-            cache.advance(1)
+            cache.replaceState(conv: outputs[1], recurrent: outputs[2], advancedBy: 1)
             return outputs[0]
         }
 
@@ -1345,9 +1341,9 @@ public enum Qwen35Language {
 
                 for (stateIndex, layerIndex) in segment.linearLayers.enumerated() {
                     let mambaCache = mambaCaches[layerIndex]!
-                    mambaCache[0] = outputs[1 + 2 * stateIndex]
-                    mambaCache[1] = outputs[2 + 2 * stateIndex]
-                    mambaCache.advance(1)
+                    mambaCache.replaceState(
+                        conv: outputs[1 + 2 * stateIndex], recurrent: outputs[2 + 2 * stateIndex],
+                        advancedBy: 1)
                 }
 
                 pendingAttention = []

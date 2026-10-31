@@ -1623,6 +1623,7 @@ public class MambaCache: ArraysCache {
     @discardableResult
     package func restoreSpeculativeCheckpoint() -> Bool {
         guard let checkpoint = speculativeCheckpoint else { return false }
+        heldStep = nil
         cache = checkpoint.state
         offset = checkpoint.offset
         leftPadding = checkpoint.leftPadding
@@ -1707,12 +1708,130 @@ public class MambaCache: ArraysCache {
         guard let checkpoint = turnCheckpoint else { return false }
         cache = checkpoint.state
         speculativeCheckpoint = nil
+        heldStep = nil
         return true
     }
 
     /// Drop the checkpoint and the memory it pins.
     public func discardTurnCheckpoint() {
         turnCheckpoint = nil
+    }
+
+    // MARK: - One-step hold (pipelined decode)
+
+    /// The state this cache held before its last single-token step, kept by reference.
+    ///
+    /// No data is copied: `gated_delta_step` allocates a fresh `state_out` and the conv window
+    /// is a fresh concatenation slice on every step, and the model replaces the cache slots
+    /// rather than mutating them (``replaceState(conv:recurrent:advancedBy:)``). So the previous
+    /// step's arrays stay valid for as long as this struct references them, at the price of one
+    /// extra state set of memory.
+    private struct HeldStep {
+        var state: [MLXArray?]
+        var offset: Int
+        var leftPadding: MLXArray?
+        var lengths: MLXArray?
+    }
+
+    private var heldStep: HeldStep?
+    private var retainsStep = false
+
+    /// Whether single-token steps keep the state they replace, so ``trim(_:)`` can take back
+    /// the last token (depth 1 only).
+    ///
+    /// Off by default: a hold costs one extra state set per cache, and only a caller that may
+    /// feed a token it has not yet confirmed (pipelined, run-ahead decode) needs it. Turning it
+    /// off releases the held state. The hold does not make the cache ``isTrimmable``: that
+    /// stays `false`, because it is the gate for whole-history reuse (shelving, spilling,
+    /// ``trimPromptCache(_:numTokens:)``), which a depth-1 hold cannot serve. Use
+    /// ``isTrimmable(after:)`` (the prediction) and ``canRewindHeldStep`` (the current fact).
+    public var retainsPreviousStep: Bool {
+        get { retainsStep }
+        set {
+            retainsStep = newValue
+            if !newValue { heldStep = nil }
+        }
+    }
+
+    /// Whether ``trim(_:)`` with `1` can take back the last step right now.
+    public var canRewindHeldStep: Bool { heldStep != nil }
+
+    /// Release the held state without restoring it (the caller confirmed the last token).
+    public func releaseHeldStep() { heldStep = nil }
+
+    /// Replace the recurrent state after a step of `tokenCount` tokens and advance the
+    /// sequence metadata, keeping the replaced state first when ``retainsPreviousStep`` is on
+    /// and the step is a single token (a longer step, such as a prefill chunk, cannot be taken
+    /// back one token at a time, so it drops any hold).
+    ///
+    /// Every model that writes a GDN step into this cache should call this instead of setting
+    /// `cache[0]`, `cache[1]` and calling `advance(_:)` separately; the capture has to happen
+    /// before the slots are replaced.
+    ///
+    /// - Parameter conv: the new conv window, or `nil` when the layer has none (kernel size 1);
+    ///   slot 0 is then left as it is.
+    public func replaceState(conv: MLXArray?, recurrent: MLXArray, advancedBy tokenCount: Int) {
+        if retainsStep, tokenCount == 1 {
+            heldStep = HeldStep(
+                state: cache, offset: offset, leftPadding: leftPadding, lengths: lengths)
+        } else {
+            heldStep = nil
+        }
+        if let conv { cache[0] = conv }
+        cache[1] = recurrent
+        advance(tokenCount)
+    }
+
+    /// A single token can be taken back when the hold is on: the step that appends it captures
+    /// the state it replaces. Deeper rewinds are never possible.
+    public override func isTrimmable(after positions: Int) -> Bool {
+        retainsStep && positions == 1
+    }
+
+    /// Never trimmable as a whole history (see ``retainsPreviousStep``).
+    public override var isTrimmable: Bool { false }
+
+    /// Take back the last single-token step by restoring the held state. Returns `1` on
+    /// success; `0` (nothing changed) for any other `n` or when nothing is held. Restores the
+    /// slots, `offset`, `leftPadding` and `lengths` as they were before the step.
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        guard n == 1, let held = heldStep else { return 0 }
+        cache = held.state
+        offset = held.offset
+        leftPadding = held.leftPadding
+        lengths = held.lengths
+        heldStep = nil
+        return 1
+    }
+
+    // Any other write to the state invalidates the hold: it describes the step just before the
+    // current slots, and only ``replaceState(conv:recurrent:advancedBy:)`` keeps that true.
+
+    public override subscript(index: Int) -> MLXArray? {
+        get { cache[index] }
+        set {
+            heldStep = nil
+            cache[index] = newValue
+        }
+    }
+
+    public override var state: [MLXArray] {
+        get { super.state }
+        set {
+            heldStep = nil
+            super.state = newValue
+        }
+    }
+
+    public override func filter(batchIndices: MLXArray) {
+        heldStep = nil
+        super.filter(batchIndices: batchIndices)
+    }
+
+    public override func extend(other: ArraysCache) {
+        heldStep = nil
+        super.extend(other: other)
     }
 
     // MARK: Rollback recording (speculative verify)

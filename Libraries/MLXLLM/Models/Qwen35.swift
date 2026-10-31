@@ -346,15 +346,14 @@ final class Qwen35GatedDeltaNet: Module {
             inputs, convState: convState, recState: cache?[1], mask: mask,
             checkpointAfter: checkpointAfter)
         if let cache {
-            cache[0] = newConvState
-            cache[1] = newRecState
             if let checkpoint, let checkpointAfter {
                 cache.saveSpeculativeCheckpoint(
                     convState: checkpoint.conv,
                     recurrentState: checkpoint.recurrent,
                     advancedBy: checkpointAfter)
             }
-            cache.advance(inputs.dim(1))
+            cache.replaceState(
+                conv: newConvState, recurrent: newRecState, advancedBy: inputs.dim(1))
         }
         return out
     }
@@ -798,9 +797,7 @@ final class Qwen35DecoderLayer: Module {
         let recState = cache[1] ?? zero.rec
 
         let out = compiledLinearLayer(self, [x, convState, recState])
-        cache[0] = out[1]
-        cache[1] = out[2]
-        cache.advance(1)
+        cache.replaceState(conv: out[1], recurrent: out[2], advancedBy: 1)
         return out[0]
     }
 
@@ -1065,9 +1062,8 @@ public class Qwen35TextModelInner: Module {
             carry = outputs[0]
             for (i, layerIndex) in segment.linearLayers.enumerated() {
                 let mambaCache = mambaCaches[layerIndex]!
-                mambaCache[0] = outputs[1 + 2 * i]
-                mambaCache[1] = outputs[2 + 2 * i]
-                mambaCache.advance(1)
+                mambaCache.replaceState(
+                    conv: outputs[1 + 2 * i], recurrent: outputs[2 + 2 * i], advancedBy: 1)
             }
 
             pendingAttention = []
