@@ -31,13 +31,13 @@ private let kRMSEps: Float = 1e-6
 
 private let _addRMSNorm: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = compile(
     shapeless: true
-) { residual, x, weight in
+) { @Sendable residual, x, weight in
     residual + MLXFast.rmsNorm(x, weight: weight, eps: kRMSEps)
 }
 
 private let _geluMul: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
     shapeless: true
-) { gate, other in
+) { @Sendable gate, other in
     geluApproximate(gate) * other
 }
 
