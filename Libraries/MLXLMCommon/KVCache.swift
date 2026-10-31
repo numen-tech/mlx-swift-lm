@@ -1759,6 +1759,15 @@ public class MambaCache: ArraysCache {
         super.extend(other: other)
     }
 
+    /// Finalizing ends a prepared (ragged) forward: the live lengths and left padding are
+    /// cleared, and so is the transient metadata a held step captured while they were set, so
+    /// ``trim(_:)`` cannot bring it back.
+    public override func finalize() {
+        heldStep?.lengths = nil
+        heldStep?.leftPadding = nil
+        super.finalize()
+    }
+
     // MARK: Rollback recording (speculative verify)
 
     /// Rebuilds the state after the first `rows` rows of the recorded pass. `base` is the cache's
@@ -1854,6 +1863,7 @@ public class MambaCache: ArraysCache {
     @discardableResult
     public func restoreRollbackBase() -> Bool {
         guard let base = rollbackBase else { return false }
+        heldStep = nil
         cache = base.state
         offset = base.offset
         leftPadding = base.leftPadding
