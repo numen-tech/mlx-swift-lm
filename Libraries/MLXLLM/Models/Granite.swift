@@ -48,33 +48,45 @@ class GraniteAttention: Module {
     public func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
+        let (queries, keys, values) = projectPreRope(x)
+        return mergeHeadsAndProject(
+            attention: cacheStep(
+                queries: queries, keys: keys, values: values, cache: cache, mask: mask))
+    }
+
+    /// The projections up to rope, in `[B, heads, L, D]` layout. The decode trace's first half.
+    func projectPreRope(_ x: MLXArray) -> (queries: MLXArray, keys: MLXArray, values: MLXArray) {
         let (B, L) = (x.dim(0), x.dim(1))
 
-        var queries = wq(x)
-        var keys = wk(x)
-        var values = wv(x)
-
         // prepare the queries, keys and values for the attention computation
-        queries = queries.reshaped(B, L, args.attentionHeads, -1).transposed(0, 2, 1, 3)
-        keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        let queries = wq(x).reshaped(B, L, args.attentionHeads, -1).transposed(0, 2, 1, 3)
+        let keys = wk(x).reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        let values = wv(x).reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        return (queries, keys, values)
+    }
 
+    /// Rope, the KV write and the attention over the cache: the part of a decode step that stays
+    /// outside the traces (the rope offset and the cache grow every token).
+    func cacheStep(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        cache: KVCache?, mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray {
         let offset = cache?.ropeOffset
-        queries = applyRotaryPosition(rope, to: queries, offset: offset)
-        keys = applyRotaryPosition(rope, to: keys, offset: offset)
-
-        let output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
+        return attentionWithCacheUpdate(
+            queries: applyRotaryPosition(rope, to: queries, offset: offset),
+            keys: applyRotaryPosition(rope, to: keys, offset: offset),
             values: values,
             cache: cache,
             scale: scale,
             mask: mask
         )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+    }
 
-        return wo(output)
+    /// The attention output `[B, heads, L, D]` back to `[B, L, heads * D]` and through `o_proj`.
+    /// The decode trace's second half.
+    func mergeHeadsAndProject(attention: MLXArray) -> MLXArray {
+        let (B, L) = (attention.dim(0), attention.dim(2))
+        return wo(attention.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
 }
 
@@ -124,11 +136,28 @@ class GraniteTransformerBlock: Module {
     public func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
-        var r = attention(inputLayerNorm(x), mask: mask, cache: cache)
+        let r = attention(inputLayerNorm(x), mask: mask, cache: cache)
+        return finishLayer(x, attention: r)
+    }
+
+    /// The residual add, the MLP and its residual add, given the attention block's output.
+    private func finishLayer(_ x: MLXArray, attention r: MLXArray) -> MLXArray {
         let h = x + r * residualMultiplier
-        r = mlp(postAttentionLayerNorm(h))
-        let out = h + r * residualMultiplier
-        return out
+        return h + mlp(postAttentionLayerNorm(h)) * residualMultiplier
+    }
+
+    // Decode trace bodies. A single-token decode step runs as compiled segments split at the KV
+    // writes (see `GraniteModelInner.decodeStep`); these are the two halves of one layer around
+    // the part that cannot be traced.
+
+    func attentionPreBody(x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        attention.projectPreRope(inputLayerNorm(x))
+    }
+
+    /// `x` is the layer input, the residual branch around the attention block; `attention` is the
+    /// SDPA output `[B, heads, 1, D]`.
+    func attentionPostBody(x: MLXArray, attention output: MLXArray) -> MLXArray {
+        finishLayer(x, attention: attention.mergeHeadsAndProject(attention: output))
     }
 }
 
@@ -138,22 +167,49 @@ public class GraniteModelInner: Module {
     let norm: RMSNorm
     let embeddingMultiplier: Float
 
+    /// Single-token decode as compiled segments split at the KV writes: segment `i` finishes layer
+    /// `i - 1` and starts layer `i` (the first only starts layer 0, the last only finishes the
+    /// final layer and applies the final norm), so a model of N layers runs N + 1 traces. Rope,
+    /// the KV write and the attention over the cache stay outside the traces: the rope offset
+    /// moves and the cache grows every token. Traces compile on first use, after the weights load.
+    private let compiledSegments: CompiledDecodeSegmentCache<GraniteModelInner>
+
     public init(_ args: GraniteConfiguration) {
         precondition(args.vocabularySize > 0)
 
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
-        self.layers = (0 ..< args.hiddenLayers)
+        let layers = (0 ..< args.hiddenLayers)
             .map { _ in
                 GraniteTransformerBlock(args)
             }
+        self.layers = layers
 
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
         self.embeddingMultiplier = args.embeddingMultiplier
+
+        let lastSegment = layers.count
+        self.compiledSegments = CompiledDecodeSegmentCache(
+            count: layers.count + 1,
+            state: { model, index in
+                // The layers the segment runs, plus the final norm in the last one.
+                var modules: [Module] = []
+                if index > 0 { modules.append(model.layers[index - 1]) }
+                if index < lastSegment { modules.append(model.layers[index]) }
+                if index == lastSegment { modules.append(model.norm) }
+                return modules
+            },
+            body: { model, index, arguments in
+                model.segmentBody(at: index, arguments)
+            })
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var h = embedTokens(inputs) * embeddingMultiplier
+
+        if let cache, let step = decodeStep(h, cache) {
+            return step
+        }
 
         let mask = createAttentionMask(h: h, cache: cache?.first)
 
@@ -162,6 +218,49 @@ public class GraniteModelInner: Module {
         }
 
         return norm(h)
+    }
+
+    /// Number of decode segments that have been compiled so far.
+    var compiledDecodeSegmentCount: Int { compiledSegments.compiledCount }
+
+    private func segmentBody(at index: Int, _ arguments: [MLXArray]) -> [MLXArray] {
+        var h = arguments[0]
+        if index > 0 {
+            h = layers[index - 1].attentionPostBody(x: h, attention: arguments[1])
+        }
+        if index == layers.count {
+            return [norm(h)]
+        }
+        let (queries, keys, values) = layers[index].attentionPreBody(x: h)
+        return [h, queries, keys, values]
+    }
+
+    /// The compiled single-token step, or nil when this call must take the general path: a
+    /// training model, a subclass, activations that are not fp16/bf16 (the traces' fused
+    /// elementwise ops are only as exact as the activation type), anything but one token of one
+    /// sequence, an attention mask, or a cache that is quantized or owns its attention.
+    private func decodeStep(_ h: MLXArray, _ cache: [KVCache]) -> MLXArray? {
+        guard type(of: self) == GraniteModelInner.self, !training,
+            h.dtype == .float16 || h.dtype == .bfloat16,
+            h.dim(0) == 1, h.dim(1) == 1,
+            cache.count == layers.count,
+            cache.allSatisfy({ usesPlainAttentionCacheRoute($0) }),
+            case .none = createAttentionMask(h: h, cache: cache.first)
+        else { return nil }
+
+        var carry = h
+        var attention: [MLXArray] = []
+        for index in 0 ... layers.count {
+            let outputs = compiledSegments(self, at: index, [carry] + attention)
+            if index == layers.count { return outputs[0] }
+            carry = outputs[0]
+            attention = [
+                layers[index].attention.cacheStep(
+                    queries: outputs[1], keys: outputs[2], values: outputs[3],
+                    cache: cache[index], mask: .none)
+            ]
+        }
+        fatalError("unreachable")
     }
 }
 
