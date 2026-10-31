@@ -57,3 +57,24 @@ final class MambaCacheRestoreDropsRecordingTests: XCTestCase {
         assertRecordingGone(cache, expecting: 2)
     }
 }
+
+/// A turn checkpoint is only captured with no lengths / left padding, so a restore leaves none.
+final class MambaCacheRestoreClearsTransientMetadataTests: XCTestCase {
+    private func filled(_ value: Float) -> MLXArray {
+        MLXArray.full([1, 3, 4], values: MLXArray(value))
+    }
+
+    func testRestoreTurnCheckpointClearsLengthsAndLeftPadding() {
+        let cache = MambaCache()
+        cache.replaceState(conv: filled(1), recurrent: filled(-1), advancedBy: 4)
+        XCTAssertTrue(cache.captureTurnCheckpoint(tokenOffset: 4))
+        cache.leftPadding = MLXArray([2])
+        cache.prepare(lengths: [1])
+        cache.replaceState(conv: filled(5), recurrent: filled(-5), advancedBy: 1)  // lengths now 0
+        XCTAssertNotNil(cache.currentLengths)
+
+        XCTAssertTrue(cache.restoreTurnCheckpoint())
+        XCTAssertNil(cache.currentLengths, "lengths belong to the abandoned pass")
+        XCTAssertNil(cache.leftPaddingValues, "so does the left padding")
+    }
+}

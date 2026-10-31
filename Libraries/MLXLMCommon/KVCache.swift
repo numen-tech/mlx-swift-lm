@@ -1716,6 +1716,10 @@ public class MambaCache: ArraysCache {
         speculativeCheckpoint = nil
         heldStep = nil
         discardRollback()  // the recording's base describes the state this restore replaces
+        // Capture requires no lengths / left padding, so the restored state has none; the ones
+        // attached now belong to the abandoned pass and would mask valid tokens.
+        lengths = nil
+        leftPadding = nil
         return true
     }
 
