@@ -1624,6 +1624,7 @@ public class MambaCache: ArraysCache {
     package func restoreSpeculativeCheckpoint() -> Bool {
         guard let checkpoint = speculativeCheckpoint else { return false }
         heldStep = nil
+        discardRollback()  // the recording's base describes the state this restore replaces
         cache = checkpoint.state
         offset = checkpoint.offset
         leftPadding = checkpoint.leftPadding
@@ -1714,6 +1715,7 @@ public class MambaCache: ArraysCache {
         cache = checkpoint.state
         speculativeCheckpoint = nil
         heldStep = nil
+        discardRollback()  // the recording's base describes the state this restore replaces
         return true
     }
 
