@@ -149,6 +149,41 @@ final class MambaCacheHoldTests: XCTestCase {
         XCTAssertFalse(cache.canRewindHeldStep)
     }
 
+    /// Codex P2 (#5): a hold taken inside `withPreparedCache` captured the temporary lengths and
+    /// left padding; `finalize()` cleared the live ones but a later `trim(1)` resurrected them.
+    func testFinalizeClearsTransientMetadataFromTheHeldStep() {
+        let cache = MambaCache(leftPadding: [2])
+        cache.retainsPreviousStep = true
+        step(cache, 1)
+        withPreparedCache([cache], lengths: [1]) {
+            step(cache, 2)
+        }
+        XCTAssertNil(cache.currentLengths, "finalize clears the live lengths")
+        XCTAssertNil(cache.leftPaddingValues, "finalize clears the live left padding")
+
+        XCTAssertEqual(cache.trim(1), 1)
+        XCTAssertEqual(value(cache[0]), 1)
+        XCTAssertNil(cache.currentLengths, "the restored step must not bring the prepared lengths back")
+        XCTAssertNil(cache.leftPaddingValues, "nor the left padding")
+    }
+
+    /// Codex P2 (#5): a single-token forward while recording a rollback held a step but recorded
+    /// nothing usable; `restoreRollbackBase()` restored the pre-forward state and left the hold, so
+    /// a following `trim(1)` "succeeded" by restoring the same state again.
+    func testRestoreRollbackBaseReleasesTheHold() {
+        let cache = MambaCache()
+        cache.retainsPreviousStep = true
+        step(cache, 1)
+        cache.beginRollbackRecording()
+        step(cache, 2)
+        XCTAssertTrue(cache.canRewindHeldStep)
+        XCTAssertTrue(cache.restoreRollbackBase())
+        XCTAssertEqual(value(cache[0]), 1, "back to the pre-pass state")
+        XCTAssertFalse(cache.canRewindHeldStep, "the hold described the discarded pass")
+        XCTAssertEqual(cache.trim(1), 0, "a second trim must not restore the same state again")
+        XCTAssertEqual(value(cache[0]), 1)
+    }
+
     // MARK: - Through the model: eager and compiled GDN decode
 
     private let tokens: [Int32] = [1, 7, 3, 9, 2, 5]
