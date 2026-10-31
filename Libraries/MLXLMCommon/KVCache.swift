@@ -1624,6 +1624,7 @@ public class MambaCache: ArraysCache {
     package func restoreSpeculativeCheckpoint() -> Bool {
         guard let checkpoint = speculativeCheckpoint else { return false }
         heldStep = nil
+        discardRollback()  // the recording's base describes the state this restore replaces
         cache = checkpoint.state
         offset = checkpoint.offset
         leftPadding = checkpoint.leftPadding
@@ -1639,7 +1640,92 @@ public class MambaCache: ArraysCache {
     public override func copy() -> any KVCache {
         let new = MambaCache()
         copyContents(to: new)
+        new.turnCheckpoint = turnCheckpoint
         return new
+    }
+
+    // MARK: - Turn-boundary checkpoint (multi-turn reuse)
+
+    /// The recurrent state of this layer after `tokenOffset` tokens of the conversation, kept by
+    /// reference so a later prompt that diverges from the cached tokens at or after that offset
+    /// can resume from it instead of rebuilding the whole recurrence from zero.
+    ///
+    /// No data is copied for the recurrent state: `gated_delta_step` allocates a fresh
+    /// `state_out` on every call and the model replaces the cache slots rather than mutating
+    /// them, so the arrays captured here stay valid for as long as this value references them,
+    /// at the price of one extra state set of memory. The conv window is the one exception: it
+    /// is a slice of the step's concatenated input, so it is materialized into its own small
+    /// buffer (one window per layer) instead of pinning the whole chunk it was cut from.
+    ///
+    /// Unlike the speculative checkpoint (one verify round) and the single-step hold, this one
+    /// lives across turns, and it is owned by the cache object: it follows the cache onto the
+    /// retention shelf and through `copy()`, and dies with it.
+    public struct TurnCheckpoint {
+        /// The number of conversation tokens the captured state has consumed.
+        public let tokenOffset: Int
+        fileprivate let state: [MLXArray?]
+
+        /// Bytes of the captured arrays (conv window plus recurrent state).
+        public var byteCount: Int { state.reduce(0) { $0 + ($1?.nbytes ?? 0) } }
+
+        /// The captured arrays, for `eval` and serialization.
+        public var arrays: [MLXArray] { state.compactMap { $0 } }
+
+        public init(tokenOffset: Int, state: [MLXArray]) {
+            self.tokenOffset = tokenOffset
+            self.state = state.map { $0 as MLXArray? }
+        }
+    }
+
+    /// The checkpoint captured by ``captureTurnCheckpoint(tokenOffset:)`` or installed by
+    /// ``installTurnCheckpoint(_:)``, if any. Not touched by the speculative checkpoint or by
+    /// writes to the live state: the live state moves past it, the checkpoint stays.
+    public private(set) var turnCheckpoint: TurnCheckpoint?
+
+    /// Capture the current state as the turn checkpoint at `tokenOffset`, replacing any earlier
+    /// one. Returns `false` (nothing changed) while the layer has no state yet or holds a batched
+    /// layout (`leftPadding` / `lengths`), which a single conversation never has.
+    @discardableResult
+    public func captureTurnCheckpoint(tokenOffset: Int) -> Bool {
+        guard leftPadding == nil, lengths == nil,
+            let conv = cache[0], let recurrent = cache[1]
+        else { return false }
+        turnCheckpoint = nil
+        // The window of a batch-1 prefill is a tail slice of the step's concatenated input, and
+        // a long-lived checkpoint must not pin that whole chunk. `contiguous()` copies only if
+        // necessary (it does copy such a slice in MLX 0.33, measured by
+        // MambaCacheTurnCheckpointMemoryTests, but that is MLX's choice, not a contract). An
+        // elementwise op always writes a new buffer of exactly the window's size.
+        let window = conv * MLXArray(1, dtype: conv.dtype)
+        eval(window, recurrent)
+        turnCheckpoint = TurnCheckpoint(tokenOffset: tokenOffset, state: [window, recurrent])
+        return true
+    }
+
+    /// Install a checkpoint built elsewhere (a restored spill), replacing any earlier one.
+    public func installTurnCheckpoint(_ checkpoint: TurnCheckpoint) {
+        turnCheckpoint = checkpoint
+    }
+
+    /// Put the live state back to the checkpoint. The checkpoint stays attached (it describes the
+    /// same tokens as the restored state). Returns `false` (nothing changed) without one.
+    @discardableResult
+    public func restoreTurnCheckpoint() -> Bool {
+        guard let checkpoint = turnCheckpoint else { return false }
+        cache = checkpoint.state
+        speculativeCheckpoint = nil
+        heldStep = nil
+        discardRollback()  // the recording's base describes the state this restore replaces
+        // Capture requires no lengths / left padding, so the restored state has none; the ones
+        // attached now belong to the abandoned pass and would mask valid tokens.
+        lengths = nil
+        leftPadding = nil
+        return true
+    }
+
+    /// Drop the checkpoint and the memory it pins.
+    public func discardTurnCheckpoint() {
+        turnCheckpoint = nil
     }
 
     // MARK: - One-step hold (pipelined decode)
