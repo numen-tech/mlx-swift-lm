@@ -675,9 +675,20 @@ public enum Qwen35Language {
         ) -> MLXArray {
             let convState =
                 cache?[0] ?? zeroStates(batch: inputs.dim(0), dtype: inputs.dtype).conv
+            // A speculative verify pass asked this cache to record what rebuilds the state after
+            // a shorter prefix (`MambaCache.beginRollbackRecording`). The checkpoint split is the
+            // older single-depth mechanism; the two are not combined.
+            let recording = cache?.isRecordingRollback == true && checkpointAfter == nil
             let result = forward(
                 inputs, convState: convState, recState: cache?[1], mask: mask,
-                checkpointAfter: checkpointAfter)
+                checkpointAfter: checkpointAfter, recordRollback: recording)
+            if recording, let cache {
+                if let rollback = result.rollback {
+                    cache.recordRollback(rows: inputs.dim(1), rebuild: rollback)
+                } else {
+                    cache.invalidateRollback()
+                }
+            }
             if let cache {
                 if let checkpoint = result.checkpoint, let checkpointAfter {
                     cache.saveSpeculativeCheckpoint(
@@ -707,12 +718,14 @@ public enum Qwen35Language {
             convState: MLXArray,
             recState: MLXArray?,
             mask: MLXArray?,
-            checkpointAfter: Int? = nil
+            checkpointAfter: Int? = nil,
+            recordRollback: Bool = false
         ) -> (
             output: MLXArray,
             convState: MLXArray,
             recurrentState: MLXArray,
-            checkpoint: (conv: MLXArray, recurrent: MLXArray)?
+            checkpoint: (conv: MLXArray, recurrent: MLXArray)?,
+            rollback: MambaCache.RollbackRebuild?
         ) {
             let B = x.dim(0)
             let S = x.dim(1)
@@ -752,7 +765,31 @@ public enum Qwen35Language {
             let out: MLXArray
             let newRecState: MLXArray
             let checkpoint: (conv: MLXArray, recurrent: MLXArray)?
-            if let split = checkpointAfter, split > 0, split < S {
+            var rollback: MambaCache.RollbackRebuild?
+            if recordRollback, mask == nil, S >= 2 {
+                // Rollback recording: the verify's own recurrence, from the same inputs, and a
+                // closure over those inputs (already materialized by this pass) that rebuilds the
+                // state after any shorter prefix without another pass through the projections.
+                let (g, beta) = gatedDeltaGates(a: a, b: b, aLog: aLog, dtBias: dtBias)
+                let kernelOK = !training
+                let window = convKernelSize - 1
+                (out, newRecState) = gatedDeltaUpdate(
+                    q: qNormed, k: kNormed, v: v, g: g, beta: beta, state: recState,
+                    mask: nil, useKernel: kernelOK)
+                rollback = { base, rows in
+                    let state = gatedDeltaReplayState(
+                        k: kNormed[0..., ..<rows, 0..., 0...],
+                        v: v[0..., ..<rows, 0..., 0...],
+                        g: g[0..., ..<rows, 0...],
+                        beta: beta[0..., ..<rows, 0...],
+                        state: base[1], useKernel: kernelOK)
+                    let conv =
+                        window > 0
+                        ? contiguous(convInput[0..., rows ..< (rows + window), 0...]) : nil
+                    return [conv, state]
+                }
+                checkpoint = nil
+            } else if let split = checkpointAfter, split > 0, split < S {
                 let prefixMask = mask.map { $0[0..., ..<split] }
                 let suffixMask = mask.map { $0[0..., split...] }
                 let (prefixOut, prefixState) = gatedDeltaUpdate(
@@ -807,7 +844,7 @@ public enum Qwen35Language {
 
             let gated = norm(out, gate: z)
             return (
-                outProj(gated.reshaped(B, S, -1)), newConvState, newRecState, checkpoint
+                outProj(gated.reshaped(B, S, -1)), newConvState, newRecState, checkpoint, rollback
             )
         }
     }

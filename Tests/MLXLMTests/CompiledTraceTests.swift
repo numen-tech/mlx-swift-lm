@@ -11,7 +11,9 @@ import MLXLMCommon
 import MLXNN
 import XCTest
 
-private final class ScaleLayer: Module {
+// @unchecked Sendable: mlx-swift 0.33's `@Sendable` stateless `compile` overload is the one
+// `testPlainCompileFreezesCapturedWeights` reaches, and its closure captures the layer.
+private final class ScaleLayer: Module, @unchecked Sendable {
     @ParameterInfo(key: "weight") var weight: MLXArray
 
     init(_ value: Float) {

@@ -95,7 +95,7 @@ private func swiglu(_ xLinear: MLXArray, _ xGlu: MLXArray, alpha: Float = 1.702,
 
 private let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
     shapeless: true
-) { xLinear, xGlu in
+) { @Sendable xLinear, xGlu in
     swiglu(xLinear, xGlu)
 }
 
