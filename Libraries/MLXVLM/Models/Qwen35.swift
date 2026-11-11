@@ -842,29 +842,58 @@ public enum Qwen35Language {
             } else if let split = checkpointAfter, split > 0, split < S {
                 let prefixMask = mask.map { $0[0..., ..<split] }
                 let suffixMask = mask.map { $0[0..., split...] }
-                let (prefixOut, prefixState) = gatedDeltaUpdate(
-                    q: qNormed[0..., ..<split, 0..., 0...],
-                    k: kNormed[0..., ..<split, 0..., 0...],
-                    v: v[0..., ..<split, 0..., 0...],
-                    a: a[0..., ..<split, 0...],
-                    b: b[0..., ..<split, 0...],
-                    aLog: aLog,
-                    dtBias: dtBias,
-                    state: recState,
-                    mask: prefixMask,
-                    useKernel: !training)
-                let (suffixOut, suffixState) = gatedDeltaUpdate(
-                    q: qNormed[0..., split..., 0..., 0...],
-                    k: kNormed[0..., split..., 0..., 0...],
-                    v: v[0..., split..., 0..., 0...],
-                    a: a[0..., split..., 0...],
-                    b: b[0..., split..., 0...],
-                    aLog: aLog,
-                    dtBias: dtBias,
-                    state: prefixState,
-                    mask: suffixMask,
-                    useKernel: !training)
+                let prefixOut: MLXArray
+                let prefixState: MLXArray
+                let suffixOut: MLXArray
+                let suffixState: MLXArray
+                if Qwen35OpCostProbe.mark != nil {
+                    // The a/b overloads below compute exactly these gates (elementwise, so the
+                    // slices of the full gates equal the gates of the slices); computed once here
+                    // so the gate and the two recurrences get their own boundaries (Codex P2).
+                    let (g, beta) = gatedDeltaGates(a: a, b: b, aLog: aLog, dtBias: dtBias)
+                    opCostMark("gdn.gates", g, beta)
+                    (prefixOut, prefixState) = gatedDeltaUpdate(
+                        q: qNormed[0..., ..<split, 0..., 0...],
+                        k: kNormed[0..., ..<split, 0..., 0...],
+                        v: v[0..., ..<split, 0..., 0...],
+                        g: g[0..., ..<split, 0...],
+                        beta: beta[0..., ..<split, 0...],
+                        state: recState, mask: prefixMask, useKernel: !training)
+                    opCostMark("gdn.recurrence", prefixOut, prefixState)
+                    (suffixOut, suffixState) = gatedDeltaUpdate(
+                        q: qNormed[0..., split..., 0..., 0...],
+                        k: kNormed[0..., split..., 0..., 0...],
+                        v: v[0..., split..., 0..., 0...],
+                        g: g[0..., split..., 0...],
+                        beta: beta[0..., split..., 0...],
+                        state: prefixState, mask: suffixMask, useKernel: !training)
+                    opCostMark("gdn.recurrence", suffixOut, suffixState)
+                } else {
+                    (prefixOut, prefixState) = gatedDeltaUpdate(
+                        q: qNormed[0..., ..<split, 0..., 0...],
+                        k: kNormed[0..., ..<split, 0..., 0...],
+                        v: v[0..., ..<split, 0..., 0...],
+                        a: a[0..., ..<split, 0...],
+                        b: b[0..., ..<split, 0...],
+                        aLog: aLog,
+                        dtBias: dtBias,
+                        state: recState,
+                        mask: prefixMask,
+                        useKernel: !training)
+                    (suffixOut, suffixState) = gatedDeltaUpdate(
+                        q: qNormed[0..., split..., 0..., 0...],
+                        k: kNormed[0..., split..., 0..., 0...],
+                        v: v[0..., split..., 0..., 0...],
+                        a: a[0..., split..., 0...],
+                        b: b[0..., split..., 0...],
+                        aLog: aLog,
+                        dtBias: dtBias,
+                        state: prefixState,
+                        mask: suffixMask,
+                        useKernel: !training)
+                }
                 out = concatenated([prefixOut, suffixOut], axis: 1)
+                opCostMark("gdn.recurrence", out)
                 newRecState = suffixState
 
                 let checkpointConv: MLXArray
