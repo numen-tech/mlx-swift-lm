@@ -790,7 +790,8 @@ public enum Qwen35Language {
             }
 
             let convOut = silu(conv1d(convInput))
-            opCostMark("gdn.conv", convOut, newConvState)
+            // Not `newConvState`: the plain step leaves that copy lazy (Codex P2, #316).
+            opCostMark("gdn.conv", convOut)
             let split = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
             let q = split[0].reshaped(B, S, numKHeads, headKDim)
             let k = split[1].reshaped(B, S, numKHeads, headKDim)
