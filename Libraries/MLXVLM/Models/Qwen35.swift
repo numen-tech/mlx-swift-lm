@@ -25,6 +25,17 @@ private func supportsExactCompiledDecode(_ dtype: DType) -> Bool {
     dtype == .float16 || dtype == .bfloat16
 }
 
+/// Bench-only op-group boundaries (numen-tech/gemma4-qat#316, `NumenOpCostBench`): when set, the
+/// eager forward calls it after every op group and compiled decode is off. Nil in production.
+public enum Qwen35OpCostProbe {
+    nonisolated(unsafe) public static var mark: ((String, [MLXArray]) -> Void)?
+}
+
+@inline(__always)
+private func opCostMark(_ label: String, _ arrays: MLXArray...) {
+    if let mark = Qwen35OpCostProbe.mark { mark(label, arrays) }
+}
+
 // MARK: - Configuration
 
 public struct Qwen35Configuration: Codable, Sendable {
@@ -398,15 +409,19 @@ public enum Qwen35Language {
             let L = x.dim(1)
 
             let qProjOutput = qProj(x)
+            opCostMark("attn.q_proj", qProjOutput)
             let qSplit = qProjOutput.reshaped(B, L, numAttentionHeads, -1).split(parts: 2, axis: -1)
             var queries = qSplit[0]
             let gate = qSplit[1].reshaped(B, L, -1)
 
             var keys = kProj(x)
+            opCostMark("attn.k_proj", keys)
             var values = vProj(x)
+            opCostMark("attn.v_proj", values)
 
             queries = qNorm(queries).transposed(0, 2, 1, 3)
             keys = kNorm(keys.reshaped(B, L, numKeyValueHeads, -1)).transposed(0, 2, 1, 3)
+            opCostMark("attn.qk_norm", queries, keys)
             values = values.reshaped(B, L, numKeyValueHeads, -1).transposed(0, 2, 1, 3)
 
             return (queries, gate, keys, values)
@@ -443,6 +458,7 @@ public enum Qwen35Language {
             let (cosValues, sinValues) = rotaryEmbedding(x: values, positionIds: positionIds!)
             (queries, keys) = applyMultimodalRotaryPosEmb(
                 q: queries, k: keys, cos: cosValues, sin: sinValues)
+            opCostMark("attn.rope", queries, keys)
 
             let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode
             if let mask {
@@ -451,7 +467,7 @@ public enum Qwen35Language {
                 attentionMask = .none
             }
 
-            return attentionWithCacheUpdate(
+            let attended = attentionWithCacheUpdate(
                 queries: queries,
                 keys: keys,
                 values: values,
@@ -459,6 +475,8 @@ public enum Qwen35Language {
                 scale: scale,
                 mask: attentionMask
             )
+            opCostMark("attn.cache_sdpa", attended)
+            return attended
         }
 
         func mergeHeadsAndProject(attention: MLXArray, gate: MLXArray) -> MLXArray {
@@ -466,7 +484,11 @@ public enum Qwen35Language {
                 attention
                 .transposed(0, 2, 1, 3)
                 .reshaped(attention.dim(0), attention.dim(2), -1)
-            return oProj(output * sigmoid(gate))
+            let gated = output * sigmoid(gate)
+            opCostMark("attn.out_gate", gated)
+            let projected = oProj(gated)
+            opCostMark("attn.o_proj", projected)
+            return projected
         }
     }
 
@@ -483,7 +505,18 @@ public enum Qwen35Language {
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
-            downProj(silu(gateProj(x)) * upProj(x))
+            guard Qwen35OpCostProbe.mark != nil else {
+                return downProj(silu(gateProj(x)) * upProj(x))
+            }
+            let g = gateProj(x)
+            opCostMark("mlp.gate_proj", g)
+            let u = upProj(x)
+            opCostMark("mlp.up_proj", u)
+            let act = silu(g) * u
+            opCostMark("mlp.act_mul", act)
+            let out = downProj(act)
+            opCostMark("mlp.down_proj", out)
+            return out
         }
     }
 
@@ -645,6 +678,17 @@ public enum Qwen35Language {
             qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
         ) {
             guard fusedInputProjectionEnabled, let fusedInProj = fusedInputProjection.fused else {
+                if Qwen35OpCostProbe.mark != nil {
+                    let qkv = inProjQKV(inputs)
+                    opCostMark("gdn.proj_qkv", qkv)
+                    let z = inProjZ(inputs).reshaped(batch, sequence, numVHeads, headVDim)
+                    opCostMark("gdn.proj_z", z)
+                    let b = inProjB(inputs)
+                    opCostMark("gdn.proj_b", b)
+                    let a = inProjA(inputs)
+                    opCostMark("gdn.proj_a", a)
+                    return (qkv, z, b, a)
+                }
                 return (
                     inProjQKV(inputs),
                     inProjZ(inputs).reshaped(batch, sequence, numVHeads, headVDim),
@@ -654,6 +698,7 @@ public enum Qwen35Language {
             }
 
             let projected = fusedInProj(inputs)
+            opCostMark("gdn.proj_fused", projected)
             let qkvEnd = keyDim * 2 + valueDim
             let zEnd = qkvEnd + valueDim
             let bEnd = zEnd + numVHeads
@@ -745,6 +790,7 @@ public enum Qwen35Language {
             }
 
             let convOut = silu(conv1d(convInput))
+            opCostMark("gdn.conv", convOut, newConvState)
             let split = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
             let q = split[0].reshaped(B, S, numKHeads, headKDim)
             let k = split[1].reshaped(B, S, numKHeads, headKDim)
@@ -761,6 +807,7 @@ public enum Qwen35Language {
             let kNormed =
                 MLXArray(invScale).asType(dtype)
                 * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: qkEps)
+            opCostMark("gdn.qk_norm", qNormed, kNormed)
 
             let out: MLXArray
             let newRecState: MLXArray
@@ -771,11 +818,13 @@ public enum Qwen35Language {
                 // closure over those inputs (already materialized by this pass) that rebuilds the
                 // state after any shorter prefix without another pass through the projections.
                 let (g, beta) = gatedDeltaGates(a: a, b: b, aLog: aLog, dtBias: dtBias)
+                opCostMark("gdn.gates", g, beta)
                 let kernelOK = !training
                 let window = convKernelSize - 1
                 (out, newRecState) = gatedDeltaUpdate(
                     q: qNormed, k: kNormed, v: v, g: g, beta: beta, state: recState,
                     mask: nil, useKernel: kernelOK)
+                opCostMark("gdn.recurrence", out, newRecState)
                 rollback = { base, rows in
                     let state = gatedDeltaReplayState(
                         k: kNormed[0..., ..<rows, 0..., 0...],
@@ -827,6 +876,15 @@ public enum Qwen35Language {
                         [B, 0, convDim], dtype: mixedQKV.dtype)
                 }
                 checkpoint = (checkpointConv, prefixState)
+            } else if Qwen35OpCostProbe.mark != nil {
+                // The a/b overload below is exactly these two calls.
+                let (g, beta) = gatedDeltaGates(a: a, b: b, aLog: aLog, dtBias: dtBias)
+                opCostMark("gdn.gates", g, beta)
+                (out, newRecState) = gatedDeltaUpdate(
+                    q: qNormed, k: kNormed, v: v, g: g, beta: beta, state: recState,
+                    mask: mask, useKernel: !training)
+                opCostMark("gdn.recurrence", out, newRecState)
+                checkpoint = nil
             } else {
                 (out, newRecState) = gatedDeltaUpdate(
                     q: qNormed,
@@ -843,8 +901,11 @@ public enum Qwen35Language {
             }
 
             let gated = norm(out, gate: z)
+            opCostMark("gdn.norm_gate", gated)
+            let projectedOut = outProj(gated.reshaped(B, S, -1))
+            opCostMark("gdn.out_proj", projectedOut)
             return (
-                outProj(gated.reshaped(B, S, -1)), newConvState, newRecState, checkpoint, rollback
+                projectedOut, newConvState, newRecState, checkpoint, rollback
             )
         }
     }
@@ -1000,19 +1061,24 @@ public enum Qwen35Language {
             }
 
             let r: MLXArray
+            let normed = inputLayerNorm(x)
+            opCostMark("layer.input_norm", normed)
             if isLinear {
                 r = linearAttn!(
-                    inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
+                    normed, mask: ssmMask, cache: cache as? MambaCache,
                     checkpointAfter: checkpointAfter)
             } else {
                 r = selfAttn!(
-                    inputLayerNorm(x), mask: attentionMask, cache: cache, positionIds: positionIds)
+                    normed, mask: attentionMask, cache: cache, positionIds: positionIds)
             }
 
             let h = x + r
-            return h
-                + mlpForward(
-                    postAttentionLayerNorm(h), allowCompiledDecode: canCompile)
+            opCostMark("layer.residual", h)
+            let postNormed = postAttentionLayerNorm(h)
+            opCostMark("layer.post_norm", postNormed)
+            let out = h + mlpForward(postNormed, allowCompiledDecode: canCompile)
+            opCostMark("layer.residual", out)
+            return out
         }
 
         private let compiledLinearLayer: CompiledTrace<DecoderLayer> = CompiledTrace(
@@ -1173,7 +1239,7 @@ public enum Qwen35Language {
             checkpointAfter: Int? = nil,
             useCompiledDecode: Bool = true
         ) -> MLXArray {
-            if useCompiledDecode, type(of: self) == Model.self, !training,
+            if useCompiledDecode, Qwen35OpCostProbe.mark == nil, type(of: self) == Model.self, !training,
                 inputsEmbeds == nil, applyFinalNorm, checkpointAfter == nil,
                 inputs.dim(0) == 1, inputs.dim(1) == 1, let cache,
                 let step = decodeStep(inputs, cache, positionIds: positionIds)
@@ -1186,6 +1252,7 @@ public enum Qwen35Language {
                 hiddenStates = inputsEmbeds
             } else {
                 hiddenStates = embedTokens(inputs)
+                opCostMark("embed", hiddenStates)
             }
 
             var cacheArray = cache
@@ -1202,9 +1269,10 @@ public enum Qwen35Language {
                 faMask = nil
             }
             let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+            for mask in [faMask, ssmMask].compactMap({ $0 }) { opCostMark("mask", mask) }
 
             let allowLayerCompilation =
-                useCompiledDecode && type(of: self) == Model.self && !training
+                useCompiledDecode && Qwen35OpCostProbe.mark == nil && type(of: self) == Model.self && !training
                 && inputsEmbeds == nil && applyFinalNorm
                 && supportsExactCompiledDecode(hiddenStates.dtype)
                 && hiddenStates.dim(0) == 1 && hiddenStates.dim(1) == 1
@@ -1244,7 +1312,10 @@ public enum Qwen35Language {
                 }
             }
 
-            return applyFinalNorm ? norm(hiddenStates) : hiddenStates
+            guard applyFinalNorm else { return hiddenStates }
+            let normed = norm(hiddenStates)
+            opCostMark("norm.final", normed)
+            return normed
         }
 
         var compiledDecodeSegmentCount: Int { compiledSegments.compiledCount }
