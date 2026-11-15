@@ -2,7 +2,7 @@ import Foundation
 import MLX
 import MLXNN
 
-private let logger = Logger(subsystem: "mlx-swift-lm", category: "paroquant")
+private let logger = MLXLogger(label: "paroquant")
 
 // MARK: - Detection
 
@@ -625,6 +625,10 @@ public func loadParoQuantModel<T: LanguageModel>(
         eosTokenIds = Set(genEos)
     }
 
+    // Honor `suppress_tokens` from generation_config.json: merge into the
+    // model's suppressed token IDs so they are masked during sampling.
+    mergeGenerationConfigSuppressedTokens(genConfig, into: model)
+
     var config = ModelConfiguration(
         directory: directory, stopStrings: genConfig?.stopStrings,
         toolCallFormat: toolCallFormat)
@@ -786,8 +790,8 @@ public func loadParoQuantModel<T: LanguageModel>(
         phaseTimes
         .map { String(format: "%@=%.2fs", $0.0, $0.1) }
         .joined(separator: " ")
-    logger.notice(
-        "ParoQuant load phases: \(breakdown, privacy: .public) total=\(String(format: "%.2f", totalSeconds), privacy: .public)s"
+    logger.info(
+        "ParoQuant load phases: \(breakdown) total=\(String(format: "%.2f", totalSeconds))s"
     )
 
     // 12b. Persist the Prepared Checkpoint in the background when this load

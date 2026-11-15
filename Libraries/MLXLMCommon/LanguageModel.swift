@@ -6,6 +6,13 @@ import MLXNN
 
 /// Abstract form of a model that processes language.
 public protocol BaseLanguageModel: Module {
+    /// Serialized namespaces whose tensors this model never loads, such as the target model in
+    /// a checkpoint that a drafter shares with it. The loader does not read them.
+    ///
+    /// Namespaces match whole dot-separated prefixes of the names before
+    /// ``prepareCheckpoint(_:)``. The default is empty.
+    var excludedCheckpointNamespaces: [String] { get }
+
     /// Normalize tensor names, values, and layer settings before loading the checkpoint.
     /// The default implementation calls ``sanitize(weights:metadata:)``.
     func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint
@@ -52,6 +59,8 @@ public protocol ModelConversionMetadataProvider {
 }
 
 extension BaseLanguageModel {
+    public var excludedCheckpointNamespaces: [String] { [] }
+
     public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
         var checkpoint = checkpoint
         checkpoint.weights = try sanitize(
@@ -284,6 +293,11 @@ public struct LMOutput {
             }
         }
 
+        /// Whether this state currently carries any model-owned values.
+        /// Package code uses this to avoid persisting a non-nil shell after
+        /// transient iterator exchange keys have been removed.
+        package var isEmpty: Bool { contents.isEmpty }
+
         enum SerializationError: LocalizedError {
             case unsupportedValue(key: String, type: String)
 
@@ -345,8 +359,8 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
     ///
     /// Implementations that chunk the prompt should drive the loop with
     /// ``PrefillParameters/forEachChunk(total:reserving:defaultStepSize:maximumStepSize:_:)``,
-    /// which owns cancellation, pooling, and per-chunk progress. An
-    /// implementation returning `.logits` owns its whole
+    /// which owns cancellation, pooling, buffer cache clearing, and per-chunk
+    /// progress. An implementation returning `.logits` owns its whole
     /// ``PrefillParameters/progress`` sequence, including the terminal
     /// `(total, total)`; one returning `.tokens` reports only its own chunks —
     /// the iterator that evaluates the remainder completes the sequence.

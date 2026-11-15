@@ -18,6 +18,12 @@ package struct Qwen35CheckpointPolicy: Sendable {
         self.preconvertedNorms = preconvertedNorms
     }
 
+    package init(modelType: String, preconvertedNorms: Bool) {
+        self.init(
+            layout: ["qwen3_5_mtp", "qwen3_8_mtp"].contains(modelType) ? .standalone : .embedded,
+            preconvertedNorms: preconvertedNorms)
+    }
+
     package static let normMetadataKey = "mlx_swift_lm.qwen_mtp.norm_convention"
     private static let mtpComponent = CheckpointComponent(
         name: "Qwen MTP", namespaces: ["mtp", "language_model.mtp"], destination: "mtp",
@@ -30,6 +36,23 @@ package struct Qwen35CheckpointPolicy: Sendable {
         ".input_layernorm.weight", ".post_attention_layernorm.weight",
         ".q_norm.weight", ".k_norm.weight",
     ]
+
+    package static let visionComponent = CheckpointComponent(
+        name: "vision_tower", namespaces: ["vision_tower", "model.visual", "visual"],
+        destination: "vision_tower")
+
+    /// The components a Qwen 3.5 checkpoint can carry.
+    package static let components: [ModelComponent: [CheckpointComponent]] = [
+        .vision: [visionComponent]
+    ]
+
+    /// Target namespaces an embedded head drops on selection, so the loader need not read them.
+    package var excludedCheckpointNamespaces: [String] {
+        layout == .embedded ? Self.mtpComponent.excludedNamespaces : []
+    }
+
+    /// The MTP head, which the target drops, so the loader need not read it.
+    package static var excludedTargetNamespaces: [String] { mtpComponent.namespaces }
 
     package static func targetWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
         let mapping = CheckpointNameMapping(mtpComponent.namespaces.map { .excludePrefix($0) })
@@ -48,9 +71,12 @@ package struct Qwen35CheckpointPolicy: Sendable {
         var rules = [CheckpointNameMapping.Rule]()
         if tiedWordEmbeddings { rules.append(.excludeModule("lm_head")) }
         if layout == .vision {
-            rules.append(.replacePrefix("model.visual", with: "vision_tower"))
+            rules += [
+                .replacePrefix("model.visual", with: "vision_tower"),
+                .replacePrefix("visual", with: "vision_tower"),
+            ]
         } else {
-            rules += [.excludePrefix("model.visual"), .excludePrefix("vision_tower")]
+            rules += visionComponent.namespaces.map { .excludePrefix($0) }
         }
         rules.append(.replacePrefix("model.language_model", with: "model"))
         if layout == .text {

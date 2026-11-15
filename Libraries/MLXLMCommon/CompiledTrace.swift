@@ -4,26 +4,6 @@ import Foundation
 import MLX
 import MLXNN
 
-// MLX traces a compiled function once. Any MLXArray the body reads but does not
-// take as an argument becomes a constant of that trace, so weights read through
-// a captured module freeze at the values of the first call. Plain inference
-// never notices. An adapter load, fuse, or unload, or a training step, keeps
-// producing the old weights.
-//
-// MLX's stateless `compile` overloads with a `@Sendable` body (here, and in
-// `CompileOverloads.swift` for the wider shapes) cannot capture an `MLXArray` or
-// a `Module`, because neither is `Sendable`. Bodies that read weights use
-// `CompiledTrace`, which declares them as compile state.
-//
-// `MLX.compile(inputs:outputs:)` is untouched: declaring captured state there
-// is correct, and it remains the way to compile a training step.
-
-// mlx-swift 0.33 ships the same `@Sendable` stateless overloads (the array form and one,
-// two and three inputs with one result) next to the unchecked ones, so the copies this
-// package used to shadow MLX with are gone: they would be ambiguous with MLX's. Callers
-// annotate the closure `@Sendable` to pick the checked overload. The wider shapes
-// (`CompileOverloads.swift`) have no MLX twin and stay.
-
 /// A compiled trace of a body that reads module weights.
 ///
 /// The declared modules' weights become compile `inputs:`, so every call reads
@@ -66,7 +46,7 @@ public final class CompiledTrace<Owner: Module>: CompiledTraceInvalidating {
     // Compiled on first call rather than at init, because weights load later.
     // The lock keeps two concurrent first calls from installing rival traces.
     private let lock = NSLock()
-    private var function: (@Sendable ([MLXArray]) -> [MLXArray])?
+    private var function: (([MLXArray]) -> [MLXArray])?
     private var tracedOwner: ObjectIdentifier?
 
     /// - Parameters:
@@ -113,7 +93,7 @@ public final class CompiledTrace<Owner: Module>: CompiledTraceInvalidating {
         self(owner, [argument])[0]
     }
 
-    private func compiled(_ owner: Owner) -> @Sendable ([MLXArray]) -> [MLXArray] {
+    private func compiled(_ owner: Owner) -> ([MLXArray]) -> [MLXArray] {
         let body = self.body
 
         // A snapshot is enough: `update(parameters:)`, the path optimizers and
@@ -126,17 +106,9 @@ public final class CompiledTrace<Owner: Module>: CompiledTraceInvalidating {
         // The one place in this package that captures a module in a compiled
         // body: `unowned` because the module stores the trace, and a strong
         // capture would cycle and leak the weights with it.
-        //
-        // mlx-swift 0.33 returns a non-Sendable closure from the stateful
-        // `compile(inputs:)` overloads (only the Sendable-capture ones return a
-        // Sendable one). Calls are serialized by MLX's own evalLock, and this
-        // type hands the closure out only through `callAsFunction`, so the
-        // closure is boxed as Sendable here.
-        nonisolated(unsafe) let compiled = MLX.compile(inputs: [weights]) {
-            [unowned owner] arguments in
+        return MLX.compile(inputs: [weights]) { [unowned owner] arguments in
             body(owner, arguments)
         }
-        return { arguments in compiled(arguments) }
     }
 }
 
