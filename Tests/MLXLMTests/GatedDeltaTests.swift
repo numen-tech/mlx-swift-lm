@@ -316,9 +316,11 @@ public class GatedDeltaTests: XCTestCase {
 
     /// A decay just below 1 must still decay the state.
     ///
-    /// In bf16, 0.999 rounds to 1. mlx core casts `g` to the dtype of `q`, so
-    /// without float32 `q` and `k` the state stops decaying and drifts away
-    /// from the custom kernel, which keeps `g` in float32 (ml-explore/mlx#4725).
+    /// In bf16, 0.999 rounds to 1. mlx core used to cast `g` to the dtype of `q`, so the state
+    /// stopped decaying and drifted away from the custom kernel, which keeps `g` in float32
+    /// (ml-explore/mlx#4725). This fork's core keeps `g` and `beta` float32 (ml-explore/mlx#4760),
+    /// and the fast route feeds bf16 `q` and `k` as they are (numen-tech/gemma4-qat#1693), so this
+    /// checks the core's fix, not a cast in Swift.
     ///
     /// On NAX hardware mlx core runs a chunked kernel that drifts more over 256
     /// steps. A lost decay still drifts far more than that.
@@ -342,10 +344,11 @@ public class GatedDeltaTests: XCTestCase {
         }
     }
 
-    /// The fork's routing (numen-tech/gemma4-qat#1692): without an opt-in a fused layout keeps
-    /// the custom kernel, bit for bit; inside one, a multi-row call takes the MLXFast kernel
-    /// (different rounding) and a single-row call does not, so a compiled decode trace built
-    /// inside an opted-in region cannot carry the fast route into later steps.
+    /// The fork's routing (numen-tech/gemma4-qat#1692, #1693): without an opt-in a fused layout
+    /// keeps the custom kernel, bit for bit; inside one, a call of `gatedDeltaFastRouteMinRows`
+    /// rows or more takes the MLXFast kernel (different rounding) and a shorter one does not, so a
+    /// compiled decode trace built inside an opted-in region cannot carry the fast route into later
+    /// steps, and the rows mlx core would run step by step stay on the custom kernel.
     func testGatedDeltaFastRouteIsOptInAndMultiRowOnly() throws {
         func run(_ inputs: Inputs) -> (MLXArray, MLXArray) {
             gatedDeltaUpdate(
@@ -364,10 +367,17 @@ public class GatedDeltaTests: XCTestCase {
         XCTAssertTrue(identical(byDefault, forcedOff), "the default must be the custom kernel")
         XCTAssertFalse(identical(byDefault, optedIn), "an opt-in must reach the MLXFast kernel")
 
-        let step = makeQwen35Inputs(T: 1)
-        XCTAssertTrue(
-            identical(run(step), GatedDeltaFastRoute.$isEnabled.withValue(true) { run(step) }),
-            "a single-row call keeps the custom kernel inside an opt-in")
+        for rows in [1, gatedDeltaFastRouteMinRows - 1] {
+            let short = makeQwen35Inputs(T: rows)
+            XCTAssertTrue(
+                identical(run(short), GatedDeltaFastRoute.$isEnabled.withValue(true) { run(short) }),
+                "a \(rows)-row call keeps the custom kernel inside an opt-in")
+        }
+        let shortest = makeQwen35Inputs(T: gatedDeltaFastRouteMinRows)
+        XCTAssertFalse(
+            identical(
+                run(shortest), GatedDeltaFastRoute.$isEnabled.withValue(true) { run(shortest) }),
+            "a \(gatedDeltaFastRouteMinRows)-row call takes the MLXFast kernel inside an opt-in")
     }
 
     /// Training must differentiate through the MLXFast kernel and get the
