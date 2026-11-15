@@ -2175,16 +2175,16 @@ public class Qwen35: Module, VLMModel {
     /// and pass `getRopeIndex` no `positionOffset` (defaults to 0) — restarting M-RoPE at
     /// zero instead of continuing from the cache. Every stock warm-cache caller
     /// avoids this by routing through `prepare()` → `prepareContinuation()`, which derives
-    /// `positionOffset` from `faCacheOffset(cache)` (plus an image-carried rope delta) and
+    /// `positionOffset` from `anchorCacheOffset(cache)` (plus an image-carried rope delta) and
     /// passes explicit `positionIds` in. This seam does the same, minus the image term (it is
-    /// text-only, so that term is always 0): derive the offset from `faCacheOffset(cache)` —
+    /// text-only, so that term is always 0): derive the offset from `anchorCacheOffset(cache)` —
     /// the same helper `prepareContinuation` uses — and pass the resulting `positionIds`
     /// explicitly, which bypasses the buggy recompute branch entirely (it only fires when
-    /// `positionIds` is nil). A cold cache (`faCacheOffset == 0`) computes the identical
+    /// `positionIds` is nil). A cold cache (`anchorCacheOffset == 0`) computes the identical
     /// `arange` positions the old unconditional call produced, so cold-cache behavior is
     /// unchanged.
     public func backboneHidden(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
-        let cacheOffset = cache.map(faCacheOffset) ?? 0
+        let cacheOffset = cache.map(anchorCacheOffset) ?? 0
         let inputs2D = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
         let (positionIds, _) = Qwen3VLLanguage.getRopeIndex(
             inputIds: inputs2D,
@@ -2227,7 +2227,7 @@ public class Qwen35: Module, VLMModel {
     /// across image/video runs).
     ///
     /// For a host that advanced a warm KV cache through `backboneHidden` (which positions
-    /// tokens at `faCacheOffset(cache)` directly and never produces a state), or that
+    /// tokens at `anchorCacheOffset(cache)` directly and never produces a state), or that
     /// restored a text-only cache without its state. Upstream's `prepare` /
     /// `callAsFunction` fail closed on a warm cache without this state (they cannot tell
     /// whether the cached prefix held images); a host that *does* know the prefix is
