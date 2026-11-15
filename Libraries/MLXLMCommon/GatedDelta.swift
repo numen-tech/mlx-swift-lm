@@ -374,6 +374,11 @@ private func fastGatedDelta(
 /// host turns it on for one region (a prefill) without touching any other caller:
 /// `GatedDeltaFastRoute.$isEnabled.withValue(true) { ... }`. The route is chosen when the graph
 /// is built, which happens inside the call, so the task-local reaches it.
+///
+/// Even when on, a single-row call keeps the custom kernel: compiled single-token decode traces
+/// (`CompiledTrace`) keep the graph of their first call, so a decode step traced inside an
+/// opted-in region would otherwise carry the fast route into every later step. A rollback-
+/// recorded verify (Qwen3.5 VLM) also keeps the custom kernel, matching its replay.
 public enum GatedDeltaFastRoute {
     @TaskLocal public static var isEnabled = false
 }
@@ -440,7 +445,7 @@ public func gatedDeltaUpdate(
     // The MLXFast kernel has a gradient and is faster than both, so upstream
     // sends the layouts it supports there in training and in inference. On this
     // fork only a caller that opts in takes it (`GatedDeltaFastRoute`).
-    if GatedDeltaFastRoute.isEnabled, hasFastGatedDelta(q: q, v: v, mask: mask) {
+    if GatedDeltaFastRoute.isEnabled, q.dim(1) > 1, hasFastGatedDelta(q: q, v: v, mask: mask) {
         return fastGatedDelta(q: q, k: k, v: v, g: g, beta: beta, state: state)
     }
     if useKernel, GatedDeltaKernelManager.shared.kernel != nil, Dk % 32 == 0 {

@@ -2288,6 +2288,16 @@ public final class RewindableConvolutionCache: MambaCache {
         return copy
     }
 
+    // The numen fork's turn checkpoint (`MambaCache.TurnCheckpoint`) holds a Gated DeltaNet
+    // layer's [conv window, recurrent state] at offset 0. This cache's slots (current state,
+    // history) and its advancing offset mean something else, and restoring them would leave the
+    // offset behind, so it never holds one.
+
+    @discardableResult
+    public override func captureTurnCheckpoint(tokenOffset: Int) -> Bool { false }
+
+    public override func installTurnCheckpoint(_ checkpoint: TurnCheckpoint) {}
+
     /// Stable prompt-cache metadata. Transient batch lengths are finalized
     /// before serialization and intentionally excluded.
     public override var metaState: [String] {

@@ -28,6 +28,22 @@ final class MambaCacheTurnCheckpointTests: XCTestCase {
         XCTAssertNil(cache.turnCheckpoint)
     }
 
+    /// Upstream's `RewindableConvolutionCache` subclasses `MambaCache` with other slot meanings
+    /// and an advancing offset, so it never takes a turn checkpoint.
+    func testRewindableConvolutionCacheTakesNoTurnCheckpoint() {
+        let cache = RewindableConvolutionCache(stateLength: 2, rollbackCapacity: 8)
+        cache.record(
+            input: filled(1, shape: [1, 5, 4]), initialState: filled(0, shape: [1, 2, 4]),
+            currentState: filled(1, shape: [1, 2, 4]))
+        XCTAssertEqual(cache.offset, 5)
+        XCTAssertFalse(cache.captureTurnCheckpoint(tokenOffset: 5))
+        cache.installTurnCheckpoint(
+            MambaCache.TurnCheckpoint(tokenOffset: 5, state: [filled(2), filled(3)]))
+        XCTAssertNil(cache.turnCheckpoint)
+        XCTAssertFalse(cache.restoreTurnCheckpoint())
+        XCTAssertEqual(cache.offset, 5)
+    }
+
     func testRestoreBringsBackTheCapturedState() throws {
         let cache = MambaCache()
         put(cache, 1)

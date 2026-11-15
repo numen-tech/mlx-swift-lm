@@ -904,9 +904,13 @@ public enum Qwen35Language {
                 opCostMark("gdn.gates", g, beta)
                 let kernelOK = !training
                 let window = convKernelSize - 1
-                (out, newRecState) = gatedDeltaUpdate(
-                    q: qNormed, k: kNormed, v: v, g: g, beta: beta, state: recState,
-                    mask: nil, useKernel: kernelOK)
+                // Always the custom kernel, as the replay below is: a recorded pass and its
+                // rebuild must run the same recurrence even inside a `GatedDeltaFastRoute` region.
+                (out, newRecState) = GatedDeltaFastRoute.$isEnabled.withValue(false) {
+                    gatedDeltaUpdate(
+                        q: qNormed, k: kNormed, v: v, g: g, beta: beta, state: recState,
+                        mask: nil, useKernel: kernelOK)
+                }
                 opCostMark("gdn.recurrence", out, newRecState)
                 rollback = { base, rows in
                     let state = gatedDeltaReplayState(

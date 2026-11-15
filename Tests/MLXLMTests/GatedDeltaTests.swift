@@ -342,6 +342,34 @@ public class GatedDeltaTests: XCTestCase {
         }
     }
 
+    /// The fork's routing (numen-tech/gemma4-qat#1692): without an opt-in a fused layout keeps
+    /// the custom kernel, bit for bit; inside one, a multi-row call takes the MLXFast kernel
+    /// (different rounding) and a single-row call does not, so a compiled decode trace built
+    /// inside an opted-in region cannot carry the fast route into later steps.
+    func testGatedDeltaFastRouteIsOptInAndMultiRowOnly() throws {
+        func run(_ inputs: Inputs) -> (MLXArray, MLXArray) {
+            gatedDeltaUpdate(
+                q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
+                aLog: inputs.aLog, dtBias: inputs.dtBias)
+        }
+        func identical(_ lhs: (MLXArray, MLXArray), _ rhs: (MLXArray, MLXArray)) -> Bool {
+            arrayEqual(lhs.0, rhs.0).item(Bool.self) && arrayEqual(lhs.1, rhs.1).item(Bool.self)
+        }
+
+        let prefill = makeQwen35Inputs(T: 37)
+        let byDefault = run(prefill)
+        let forcedOff = GatedDeltaFastRoute.$isEnabled.withValue(false) { run(prefill) }
+        let optedIn = GatedDeltaFastRoute.$isEnabled.withValue(true) { run(prefill) }
+        XCTAssertFalse(GatedDeltaFastRoute.isEnabled)
+        XCTAssertTrue(identical(byDefault, forcedOff), "the default must be the custom kernel")
+        XCTAssertFalse(identical(byDefault, optedIn), "an opt-in must reach the MLXFast kernel")
+
+        let step = makeQwen35Inputs(T: 1)
+        XCTAssertTrue(
+            identical(run(step), GatedDeltaFastRoute.$isEnabled.withValue(true) { run(step) }),
+            "a single-row call keeps the custom kernel inside an opt-in")
+    }
+
     /// Training must differentiate through the MLXFast kernel and get the
     /// gradients of the ops path.
     func testGatedDeltaFastPathGradientsMatchTheOpsPath() throws {
