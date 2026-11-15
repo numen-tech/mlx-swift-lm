@@ -27,6 +27,89 @@ func testQwen35VLMTextConfigurationDecodesMTPFields() throws {
     #expect(cfg.mtpUseDedicatedEmbeddings == false)
 }
 
+@Suite
+struct Qwen35MTPCompatibilityTests {
+    @Test
+    func validatesTargetFamily() throws {
+        let textConfig = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let textTarget = MLXLLM.Qwen35TextModel(textConfig)
+        let textDrafter = MLXLLM.Qwen35MTPDraftModel(textConfig)
+        let wrappedTextConfig = try JSONDecoder().decode(
+            MLXLLM.Qwen35Configuration.self,
+            from: Data(qwen35WrappedTextConfigJSON(modelType: "qwen3_5").utf8))
+
+        let vlmConfig = try JSONDecoder().decode(
+            MLXVLM.Qwen35Configuration.self,
+            from: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8))
+        let vlmTarget = MLXVLM.Qwen35(vlmConfig)
+        let vlmDrafter = MLXVLM.Qwen35VLMNextNDraftModel(vlmConfig)
+
+        try textDrafter.validateCompatibility(with: textTarget)
+        try textDrafter.validateCompatibility(with: MLXLLM.Qwen35Model(wrappedTextConfig))
+        try vlmDrafter.validateCompatibility(with: vlmTarget)
+
+        #expect(throws: MTPDrafterCompatibilityError.self) {
+            try textDrafter.validateCompatibility(with: vlmTarget)
+        }
+        #expect(throws: MTPDrafterCompatibilityError.self) {
+            try vlmDrafter.validateCompatibility(with: textTarget)
+        }
+    }
+
+    @Test
+    func textDrafterRejectsSameFamilyDimensionMismatches() throws {
+        let drafterConfig = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let drafter = MLXLLM.Qwen35MTPDraftModel(drafterConfig)
+
+        let hiddenSizeMismatch = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1, hiddenSize: 32).utf8))
+        #expect(throws: MTPDrafterCompatibilityError.self) {
+            try drafter.validateCompatibility(
+                with: MLXLLM.Qwen35TextModel(hiddenSizeMismatch))
+        }
+
+        let vocabularySizeMismatch = try JSONDecoder().decode(
+            MLXLLM.Qwen35Configuration.self,
+            from: Data(
+                qwen35WrappedTextConfigJSON(
+                    modelType: "qwen3_5", vocabularySize: 17
+                ).utf8))
+        #expect(throws: MTPDrafterCompatibilityError.self) {
+            try drafter.validateCompatibility(
+                with: MLXLLM.Qwen35Model(vocabularySizeMismatch))
+        }
+    }
+
+    @Test
+    func vlmDrafterRejectsSameFamilyDimensionMismatches() throws {
+        let drafterConfig = try JSONDecoder().decode(
+            MLXVLM.Qwen35Configuration.self,
+            from: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8))
+        let drafter = MLXVLM.Qwen35VLMNextNDraftModel(drafterConfig)
+
+        let hiddenSizeMismatch = try JSONDecoder().decode(
+            MLXVLM.Qwen35Configuration.self,
+            from: Data(qwen35VLMConfigJSON(mtpLayers: 1, hiddenSize: 32).utf8))
+        #expect(throws: MTPDrafterCompatibilityError.self) {
+            try drafter.validateCompatibility(
+                with: MLXVLM.Qwen35(hiddenSizeMismatch))
+        }
+
+        let vocabularySizeMismatch = try JSONDecoder().decode(
+            MLXVLM.Qwen35Configuration.self,
+            from: Data(qwen35VLMConfigJSON(mtpLayers: 1, vocabularySize: 17).utf8))
+        #expect(throws: MTPDrafterCompatibilityError.self) {
+            try drafter.validateCompatibility(
+                with: MLXVLM.Qwen35(vocabularySizeMismatch))
+        }
+    }
+}
+
 @Test
 func testQwen35MTPDraftSanitizeKeepsAndShiftsMTPNorms() throws {
     let cfg = try JSONDecoder().decode(
@@ -322,6 +405,241 @@ struct Qwen35MTPMetalTests {
     }
 
     @Test
+    func testQwen35TextDrafterFinalizesAndResumesCanonicalBoundary() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let target = MLXLLM.Qwen35TextModel(cfg)
+        let drafter = MLXLLM.Qwen35MTPDraftModel(cfg)
+        let sampler = GenerateParameters(temperature: 0).sampler()
+        let prompt = MLXArray([Int32(1), 2, 3]).reshaped([1, 3])
+
+        var targetState = LMOutput.State()
+        targetState[mtpEmitFlagKey] = true
+        let targetOutput = target(LMInput.Text(tokens: prompt), cache: nil, state: targetState)
+        let promptHidden = try #require(targetOutput.state?[mtpLastHiddenStatesKey])
+
+        var state = drafter.makeState(parameters: nil)
+        var bonus = MLXArray([Int32(4)])
+        drafter.prepareDrafterState(
+            target: target, promptTokens: prompt, targetHidden: promptHidden,
+            firstBonus: bonus, positionDeltas: nil, state: &state, sampler: sampler)
+        let proposal = drafter.draftBlock(
+            target: target, lastToken: bonus,
+            lastHidden: promptHidden[0..., (-1)..., 0...], sharedKV: [:],
+            positionDeltas: nil, queryOffset: 3, blockSize: 2,
+            state: &state, sampler: sampler)
+        let verifyHidden = MLXArray.zeros([1, 2, cfg.hiddenSize])
+        bonus = MLXArray([Int32(5)])
+        drafter.commitDrafterState(
+            target: target, targetHidden: verifyHidden, draftTokens: proposal,
+            acceptedCount: 1, finalToken: bonus, positionDeltas: nil,
+            state: &state, sampler: sampler)
+        eval(state.seedToken!, state.seedHidden!)
+        #expect(state.nextPosition == 5)
+        #expect(state.cache.allSatisfy { $0.offset == 5 })
+
+        let boundaryHidden = verifyHidden[0..., 1 ..< 2, 0...]
+        #expect(
+            drafter.finalizeDrafterState(
+                target: target, targetBoundaryHidden: boundaryHidden,
+                targetProcessedTokenCount: 5, discardedTargetTokens: 0,
+                positionDeltas: nil, state: &state))
+        #expect(state.nextPosition == 4)
+        #expect(state.cache.allSatisfy { $0.offset == 4 })
+        #expect(state.seedToken == nil)
+        #expect(state.seedHidden == nil)
+
+        let suffix = MLXArray([Int32(6), 7]).reshaped([1, 2])
+        let suffixHidden = MLXArray.zeros([1, 2, cfg.hiddenSize])
+        #expect(
+            drafter.resumeDrafterState(
+                target: target, suffixTokens: suffix,
+                suffixTargetHidden: suffixHidden,
+                targetBoundaryHidden: boundaryHidden,
+                firstBonus: MLXArray([Int32(8)]), positionDeltas: nil,
+                state: &state, sampler: sampler))
+        eval(state.seedToken!, state.seedHidden!)
+        #expect(state.nextPosition == 7)
+        #expect(state.cache.allSatisfy { $0.offset == 7 })
+    }
+
+    @Test
+    func testQwen35TextDrafterFinalizationAlsoDiscardsTargetLookahead() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let target = MLXLLM.Qwen35TextModel(cfg)
+        let drafter = MLXLLM.Qwen35MTPDraftModel(cfg)
+        let sampler = GenerateParameters(temperature: 0).sampler()
+        let prompt = MLXArray([Int32(1), 2, 3]).reshaped([1, 3])
+        let hidden = MLXArray.zeros([1, 3, cfg.hiddenSize])
+        var state = drafter.makeState(parameters: nil)
+        drafter.prepareDrafterState(
+            target: target, promptTokens: prompt, targetHidden: hidden,
+            firstBonus: MLXArray([Int32(4)]), positionDeltas: nil,
+            state: &state, sampler: sampler)
+        let proposal = drafter.draftBlock(
+            target: target, lastToken: MLXArray([Int32(4)]),
+            lastHidden: hidden[0..., (-1)..., 0...], sharedKV: [:],
+            positionDeltas: nil, queryOffset: 3, blockSize: 2,
+            state: &state, sampler: sampler)
+        let verifyHidden = MLXArray.zeros([1, 2, cfg.hiddenSize])
+        drafter.commitDrafterState(
+            target: target, targetHidden: verifyHidden, draftTokens: proposal,
+            acceptedCount: 1, finalToken: MLXArray([Int32(5)]),
+            positionDeltas: nil, state: &state, sampler: sampler)
+
+        #expect(state.nextPosition == 5)
+        #expect(
+            drafter.finalizeDrafterState(
+                target: target,
+                targetBoundaryHidden: verifyHidden[0..., ..<1, 0...],
+                targetProcessedTokenCount: 4, discardedTargetTokens: 1,
+                positionDeltas: nil, state: &state))
+        #expect(state.nextPosition == 3)
+        #expect(state.cache.allSatisfy { $0.offset == 3 })
+    }
+
+    @Test
+    func testQwen35VLMDrafterResumeKeepsPositionDeltaAlignment() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXVLM.Qwen35Configuration.self,
+            from: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8))
+        let target = MLXVLM.Qwen35(cfg)
+        let drafter = MLXVLM.Qwen35VLMNextNDraftModel(cfg)
+        let sampler = GenerateParameters(temperature: 0).sampler()
+        let prompt = MLXArray([Int32(1), 2, 3]).reshaped([1, 3])
+        let hidden = MLXArray.zeros([1, 3, cfg.textConfiguration.hiddenSize])
+        let positionDeltas = MLXArray([Int32(2)])
+        var state = drafter.makeState(parameters: nil)
+
+        drafter.prepareDrafterState(
+            target: target, promptTokens: prompt, targetHidden: hidden,
+            firstBonus: MLXArray([Int32(4)]), positionDeltas: positionDeltas,
+            state: &state, sampler: sampler)
+        #expect(state.nextPosition == 3)
+        #expect(
+            drafter.finalizeDrafterState(
+                target: target,
+                targetBoundaryHidden: hidden[0..., (-1)..., 0...],
+                targetProcessedTokenCount: 3, discardedTargetTokens: 0,
+                positionDeltas: positionDeltas, state: &state))
+        #expect(state.nextPosition == 2)
+
+        #expect(
+            drafter.resumeDrafterState(
+                target: target,
+                suffixTokens: MLXArray([Int32(5), 6]).reshaped([1, 2]),
+                suffixTargetHidden: MLXArray.zeros(
+                    [1, 2, cfg.textConfiguration.hiddenSize]),
+                targetBoundaryHidden: hidden[0..., (-1)..., 0...],
+                firstBonus: MLXArray([Int32(7)]),
+                positionDeltas: positionDeltas, state: &state, sampler: sampler))
+        eval(state.seedToken!, state.seedHidden!)
+        #expect(state.nextPosition == 5)
+        #expect(state.cache.allSatisfy { $0.offset == 5 })
+    }
+
+    @Test
+    func testQwen35TextChatSessionResumesActualDrafterState() async throws {
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let target = MLXLLM.Qwen35TextModel(cfg)
+        let tokenizer = ReversibleQwenMTPTokenizer()
+        let processor = ReversibleQwenMTPInputProcessor(tokenizer: tokenizer)
+        let context = ModelContext(
+            configuration: processor.configuration,
+            model: target,
+            processor: processor,
+            tokenizer: tokenizer)
+        let drafterContainer = MTPDrafterContainer(
+            context: MTPDrafterContext(
+                configuration: processor.configuration,
+                model: MLXLLM.Qwen35MTPDraftModel(cfg)))
+        let speculative = ChatSession(
+            context,
+            speculativeDecoding: try SpeculativeDecodingConfig(
+                mtpDrafter: drafterContainer, blockSize: 2),
+            generateParameters: .init(maxTokens: 4, temperature: 0))
+        let targetOnly = ChatSession(
+            context,
+            generateParameters: .init(maxTokens: 4, temperature: 0))
+
+        let firstPrompt = tokenizer.text(for: 1)
+        let secondPrompt = tokenizer.text(for: 2)
+        let speculativeFirst = try await collectQwenChatDetails(
+            speculative.streamDetails(to: firstPrompt))
+        let targetFirst = try await collectQwenChatDetails(
+            targetOnly.streamDetails(to: firstPrompt))
+        let fork = await speculative.fork()
+        let forkSecond = try await collectQwenChatDetails(
+            fork.streamDetails(to: secondPrompt))
+        let speculativeSecond = try await collectQwenChatDetails(
+            speculative.streamDetails(to: secondPrompt))
+        let targetSecond = try await collectQwenChatDetails(
+            targetOnly.streamDetails(to: secondPrompt))
+
+        #expect(speculativeFirst.text == targetFirst.text)
+        #expect(speculativeSecond.text == targetSecond.text)
+        #expect(speculativeSecond.info.promptTokenCount == 2)
+        #expect(speculativeSecond.info.cachedPromptTokenCount > 0)
+        #expect((speculativeSecond.info.proposedDraftTokens ?? 0) > 0)
+        #expect(speculativeSecond.info.passthroughReason == nil)
+        #expect(forkSecond.text == targetSecond.text)
+        #expect(forkSecond.info.promptTokenCount == 2)
+        #expect(forkSecond.info.cachedPromptTokenCount > 0)
+        #expect((forkSecond.info.proposedDraftTokens ?? 0) > 0)
+        #expect(forkSecond.info.passthroughReason == nil)
+    }
+
+    @Test
+    func testQwen35VLMChatSessionResumesActualDrafterState() async throws {
+        let cfg = try JSONDecoder().decode(
+            MLXVLM.Qwen35Configuration.self,
+            from: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8))
+        let target = MLXVLM.Qwen35(cfg)
+        let tokenizer = ReversibleQwenMTPTokenizer()
+        let processor = ReversibleQwenMTPInputProcessor(tokenizer: tokenizer)
+        let context = ModelContext(
+            configuration: processor.configuration,
+            model: target,
+            processor: processor,
+            tokenizer: tokenizer)
+        let drafterContainer = MTPDrafterContainer(
+            context: MTPDrafterContext(
+                configuration: processor.configuration,
+                model: MLXVLM.Qwen35VLMNextNDraftModel(cfg)))
+        let speculative = ChatSession(
+            context,
+            speculativeDecoding: try SpeculativeDecodingConfig(
+                mtpDrafter: drafterContainer, blockSize: 2),
+            generateParameters: .init(maxTokens: 4, temperature: 0))
+        let targetOnly = ChatSession(
+            context,
+            generateParameters: .init(maxTokens: 4, temperature: 0))
+
+        let firstPrompt = tokenizer.text(for: 1)
+        let secondPrompt = tokenizer.text(for: 2)
+        let speculativeFirst = try await collectQwenChatDetails(
+            speculative.streamDetails(to: firstPrompt))
+        let targetFirst = try await collectQwenChatDetails(
+            targetOnly.streamDetails(to: firstPrompt))
+        let speculativeSecond = try await collectQwenChatDetails(
+            speculative.streamDetails(to: secondPrompt))
+        let targetSecond = try await collectQwenChatDetails(
+            targetOnly.streamDetails(to: secondPrompt))
+
+        #expect(speculativeFirst.text == targetFirst.text)
+        #expect(speculativeSecond.text == targetSecond.text)
+        #expect(speculativeSecond.info.promptTokenCount == 2)
+        #expect(speculativeSecond.info.cachedPromptTokenCount > 0)
+        #expect((speculativeSecond.info.proposedDraftTokens ?? 0) > 0)
+        #expect(speculativeSecond.info.passthroughReason == nil)
+    }
+
+    @Test
     func testQwen35GDNCheckpointMatchesPrefixWithoutReplayingProjections() throws {
         let cfg = try JSONDecoder().decode(
             MLXLLM.Qwen35TextConfiguration.self,
@@ -408,6 +726,71 @@ struct Qwen35MTPMetalTests {
     }
 }
 
+private struct ReversibleQwenMTPTokenizer: Tokenizer {
+    private let scalarBase = 0xE000
+
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+
+    func text(for token: Int) -> String {
+        String(UnicodeScalar(scalarBase + token)!)
+    }
+
+    func encode(text: String, addSpecialTokens _: Bool) -> [Int] {
+        text.unicodeScalars.map { scalar in
+            let value = Int(scalar.value) - scalarBase
+            return (0 ..< 16).contains(value) ? value : 1
+        }
+    }
+
+    func decode(tokenIds: [Int], skipSpecialTokens _: Bool) -> String {
+        tokenIds.map(text(for:)).joined()
+    }
+
+    func convertTokenToId(_: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { text(for: id) }
+
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools _: [[String: any Sendable]]?,
+        additionalContext _: [String: any Sendable]?
+    ) throws -> [Int] {
+        messages.flatMap { message in
+            encode(
+                text: message["content"] as? String ?? "",
+                addSpecialTokens: false)
+        }
+    }
+}
+
+private struct ReversibleQwenMTPInputProcessor: UserInputProcessor {
+    let tokenizer: ReversibleQwenMTPTokenizer
+    let configuration = ModelConfiguration(id: "tiny-qwen-mtp-chat-session")
+
+    func prepare(input: UserInput) async throws -> LMInput {
+        let messages = DefaultMessageGenerator().generate(from: input)
+        return LMInput(
+            tokens: MLXArray(
+                try tokenizer.applyChatTemplate(
+                    messages: messages,
+                    tools: input.tools,
+                    additionalContext: input.additionalContext)))
+    }
+}
+
+private func collectQwenChatDetails(
+    _ stream: AsyncThrowingStream<Generation, Error>
+) async throws -> (text: String, info: GenerateCompletionInfo) {
+    var text = ""
+    var info: GenerateCompletionInfo?
+    for try await event in stream {
+        text += event.chunk ?? ""
+        if let completion = event.info { info = completion }
+    }
+    return (text, try #require(info))
+}
+
 @Suite(.serialized)
 struct Qwen35MTPRegistrationTests {
     @Test
@@ -426,7 +809,7 @@ struct Qwen35MTPRegistrationTests {
             modelType: "qwen3_5")
         #expect(wrappedTextModel is MLXLLM.Qwen35MTPDraftModel)
 
-        let vlmModel = try await MTPDrafterTypeRegistry.shared.createModel(
+        let vlmModel = try await MTPDrafterTypeRegistry.visionLanguage.createModel(
             configuration: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8),
             modelType: "qwen3_5")
         #expect(vlmModel is MLXVLM.Qwen35VLMNextNDraftModel)
@@ -439,14 +822,33 @@ struct Qwen35MTPRegistrationTests {
         #expect(standalone.requiresPromptPrefill)
         #expect(!standalone.requiresSharedTargetKV)
         #expect(standalone.requiresGreedySampling)
+
+        let standaloneVLM = try await MTPDrafterTypeRegistry.visionLanguage.createModel(
+            configuration: Data(qwen35StandaloneMTPConfigJSON().utf8),
+            modelType: "qwen3_5_mtp")
+        #expect(standaloneVLM is MLXVLM.Qwen35VLMNextNDraftModel)
+
+        let textConfig = try JSONDecoder.json5().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let vlmConfig = try JSONDecoder.json5().decode(
+            MLXVLM.Qwen35Configuration.self,
+            from: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8))
+        let textTarget = MLXLLM.Qwen35TextModel(textConfig)
+        let vlmTarget = MLXVLM.Qwen35(vlmConfig)
+
+        #expect(standalone.isCompatible(with: textTarget))
+        #expect(!standalone.isCompatible(with: vlmTarget))
+        #expect(standaloneVLM.isCompatible(with: vlmTarget))
+        #expect(!standaloneVLM.isCompatible(with: textTarget))
     }
 
     @Test
-    func registrationsAreOrderIndependentForSharedModelTypes() async throws {
+    func registrationsAreIsolatedByTargetArchitecture() async throws {
         await MLXVLM.Qwen35VLMMTPRegistration.register()
         await MLXLLM.Qwen35TextMTPRegistration.register()
 
-        let vlmModel = try await MTPDrafterTypeRegistry.shared.createModel(
+        let vlmModel = try await MTPDrafterTypeRegistry.visionLanguage.createModel(
             configuration: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8),
             modelType: "qwen3_5")
         #expect(vlmModel is MLXVLM.Qwen35VLMNextNDraftModel)
@@ -461,12 +863,14 @@ struct Qwen35MTPRegistrationTests {
 private func qwen35TextConfigJSON(
     mtpLayers: Int,
     mtpUseDedicatedEmbeddings: Bool = false,
-    numExperts: Int = 0
+    numExperts: Int = 0,
+    hiddenSize: Int = 16,
+    vocabularySize: Int = 16
 ) -> String {
     """
     {
       "model_type": "qwen3_5_text",
-      "hidden_size": 16,
+      "hidden_size": \(hiddenSize),
       "num_hidden_layers": 1,
       "intermediate_size": 32,
       "num_attention_heads": 2,
@@ -478,7 +882,7 @@ private func qwen35TextConfigJSON(
       "linear_value_head_dim": 8,
       "linear_conv_kernel_dim": 2,
       "rms_norm_eps": 1e-6,
-      "vocab_size": 16,
+      "vocab_size": \(vocabularySize),
       "rope_theta": 100000.0,
       "partial_rotary_factor": 0.25,
       "max_position_embeddings": 64,
@@ -500,11 +904,18 @@ private func qwen35TextConfigJSON(
     """
 }
 
-private func qwen35VLMConfigJSON(mtpLayers: Int) -> String {
+private func qwen35VLMConfigJSON(
+    mtpLayers: Int,
+    hiddenSize: Int = 16,
+    vocabularySize: Int = 16
+) -> String {
     """
     {
       "model_type": "qwen3_5",
-      "text_config": \(qwen35TextConfigJSON(mtpLayers: mtpLayers)),
+      "text_config": \(qwen35TextConfigJSON(
+          mtpLayers: mtpLayers,
+          hiddenSize: hiddenSize,
+          vocabularySize: vocabularySize)),
       "vision_config": {
         "model_type": "qwen3_5_vit",
         "depth": 1,
@@ -521,11 +932,18 @@ private func qwen35VLMConfigJSON(mtpLayers: Int) -> String {
     """
 }
 
-private func qwen35WrappedTextConfigJSON(modelType: String) -> String {
+private func qwen35WrappedTextConfigJSON(
+    modelType: String,
+    hiddenSize: Int = 16,
+    vocabularySize: Int = 16
+) -> String {
     """
     {
       "model_type": "\(modelType)",
-      "text_config": \(qwen35TextConfigJSON(mtpLayers: 1))
+      "text_config": \(qwen35TextConfigJSON(
+          mtpLayers: 1,
+          hiddenSize: hiddenSize,
+          vocabularySize: vocabularySize))
     }
     """
 }
@@ -559,6 +977,31 @@ struct Qwen35CheckpointLoadingTests {
             context.model.modules().compactMap { $0 as? QuantizedLinear }.contains { $0.bits == 4 })
     }
 
+    /// A head embedded in a target checkpoint reads only its own tensors; a standalone head
+    /// reads every tensor.
+    @Test(arguments: [false, true])
+    func drafterDoesNotReadTargetTensors(vision: Bool) async throws {
+        for standalone in [false, true] {
+            let fixture = try await makeFixture(
+                vision: vision, standalone: standalone, prefix: standalone ? "" : "mtp.")
+            defer { try? FileManager.default.removeItem(at: fixture.directory) }
+            let context = try await fixture.factory.load(
+                from: fixture.directory, using: UnusedTokenizerLoader())
+
+            let url = fixture.directory.appendingPathComponent("model.safetensors")
+            let all = try loadModelCheckpoint(urls: [url]).weights.keys
+            let read = try loadModelCheckpoint(
+                urls: [url], excludedNamespaces: context.model.excludedCheckpointNamespaces
+            ).weights.keys
+            if standalone {
+                #expect(Set(read) == Set(all))
+            } else {
+                #expect(all.contains("model.embed_tokens.weight"))
+                #expect(Set(read) == Set(all.filter { $0.hasPrefix("mtp.") }))
+            }
+        }
+    }
+
     @Test(arguments: [false, true])
     func targetLoaderExcludesConvertedMTPComponent(vision: Bool) throws {
         let data = try fixtureConfiguration(vision: vision, standalone: false, bits: nil)
@@ -571,7 +1014,7 @@ struct Qwen35CheckpointLoadingTests {
                 try JSONDecoder().decode(MLXLLM.Qwen35Configuration.self, from: data))
         }
         var weights = Dictionary(uniqueKeysWithValues: target.parameters().flattened())
-        let count = weights.count
+        let expectedKeys = Set(weights.keys)
         weights["language_model.mtp.norm.weight"] = MLXArray.zeros([64])
         weights["language_model.mtp.fc.weight"] = MLXArray.zeros([64, 128])
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -581,8 +1024,8 @@ struct Qwen35CheckpointLoadingTests {
         try save(
             arrays: weights, metadata: ["format": "mlx"],
             url: directory.appendingPathComponent("model.safetensors"))
-        try loadWeights(modelDirectory: directory, model: target)
-        #expect(target.parameters().flattened().count == count)
+        try loadWeights(modelDirectory: directory, model: target, componentLoading: .immediate)
+        #expect(Set(target.parameters().flattened().map(\.0)) == expectedKeys)
     }
 
     @Test
@@ -656,6 +1099,41 @@ struct Qwen35CheckpointLoadingTests {
         #expect(fc.bits == 8)
         let projections = context.model.modules().compactMap { $0 as? MLXNN.QuantizedLinear }
         #expect(projections.contains { $0.bits == bits })
+    }
+
+    @Test(arguments: [false, true], [false, true])
+    func registeredFactoriesLoadQwen38Components(vision: Bool, standalone: Bool) async throws {
+        await Qwen35TextMTPRegistration.register()
+        await Qwen35VLMMTPRegistration.register()
+        let fixture = try await makeFixture(
+            vision: vision, standalone: standalone,
+            prefix: standalone ? "" : "language_model.mtp.", bits: 4, family: "qwen3_8")
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let factory = vision ? MTPDrafterModelFactory.visionLanguage : .shared
+        let context = try await factory.load(
+            from: fixture.directory, using: UnusedTokenizerLoader())
+        let parameters = context.model.parameters().flattened()
+        #expect(parameters.count == 31)
+        let norm = try #require(parameters.first { $0.0 == "mtp.norm.weight" }?.1)
+        #expect(norm.asArray(Float.self) == Array(repeating: 1, count: 64))
+        let fc = try #require(
+            (context.model as? MLXLLM.Qwen35MTPDraftModel)?.mtp.fc as? QuantizedLinear
+                ?? (context.model as? MLXVLM.Qwen35VLMNextNDraftModel)?.mtp.fc as? QuantizedLinear)
+        #expect(fc.bits == 8)
+        #expect(
+            context.model.modules().compactMap { $0 as? QuantizedLinear }.contains { $0.bits == 4 })
+    }
+
+    @Test(arguments: ["qwen3_5", "qwen3_8"])
+    func standaloneVLMRegistrationUsesOuterModelType(family: String) async throws {
+        await Qwen35VLMMTPRegistration.register()
+        let fixture = try await makeFixture(
+            vision: true, standalone: true, bits: 4, family: family)
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let context = try await MTPDrafterModelFactory.visionLanguage.load(
+            from: fixture.directory, using: UnusedTokenizerLoader())
+        #expect(context.model is MLXVLM.Qwen35VLMNextNDraftModel)
+        #expect(context.model.parameters().flattened().count == 31)
     }
 
     @Test(arguments: [false, true], ["mtp.", "language_model.mtp."])
@@ -761,10 +1239,10 @@ struct Qwen35CheckpointLoadingTests {
         }
     }
 
-    @Test
-    func unknownAndMissingWeightsStillFailStrictFactoryLoading() async throws {
+    @Test(arguments: ["qwen3_5", "qwen3_8"])
+    func unknownAndMissingWeightsStillFailStrictFactoryLoading(family: String) async throws {
         for missing in [false, true] {
-            let fixture = try await makeFixture(vision: false, standalone: true)
+            let fixture = try await makeFixture(vision: false, standalone: true, family: family)
             defer { try? FileManager.default.removeItem(at: fixture.directory) }
             let url = fixture.directory.appendingPathComponent("model.safetensors")
             var weights = try loadArrays(url: url)
@@ -813,12 +1291,13 @@ struct Qwen35CheckpointLoadingTests {
     }
 
     private func makeFixture(
-        vision: Bool, standalone: Bool, prefix: String = "", bits: Int? = nil
+        vision: Bool, standalone: Bool, prefix: String = "", bits: Int? = nil,
+        family: String = "qwen3_5"
     ) async throws -> Fixture {
         let config = try fixtureConfiguration(
-            vision: vision, standalone: standalone, bits: bits, prefix: prefix)
+            vision: vision, standalone: standalone, bits: bits, prefix: prefix, family: family)
         let registry = ModelTypeRegistry<any MTPDrafterModel>()
-        let modelType = standalone ? "qwen3_5_mtp" : "qwen3_5"
+        let modelType = standalone ? family + "_mtp" : family
         await registry.registerModelType(modelType) { data in
             try makeDrafter(configuration: data, vision: vision)
         }
@@ -853,7 +1332,8 @@ struct Qwen35CheckpointLoadingTests {
     }
 
     private func fixtureConfiguration(
-        vision: Bool, standalone: Bool, bits: Int?, prefix: String = "mtp."
+        vision: Bool, standalone: Bool, bits: Int?, prefix: String = "mtp.",
+        family: String = "qwen3_5"
     ) throws -> Data {
         let json =
             vision
@@ -866,7 +1346,12 @@ struct Qwen35CheckpointLoadingTests {
         .replacingOccurrences(of: "\"head_dim\": 8", with: "\"head_dim\": 32")
         var root = try #require(
             JSONSerialization.jsonObject(with: Data(sized.utf8)) as? [String: Any])
-        if standalone { root["model_type"] = "qwen3_5_mtp" }
+        root["model_type"] = standalone ? family + "_mtp" : family
+        if var text = root["text_config"] as? [String: Any] {
+            text["model_type"] = family + "_text"
+            root["text_config"] = text
+        }
+        if standalone { root["vision_config"] = [String: Any]() }
         if let bits {
             root["quantization"] = [
                 "group_size": 32, "bits": bits,
@@ -879,11 +1364,23 @@ struct Qwen35CheckpointLoadingTests {
 
 private func makeDrafter(configuration: Data, vision: Bool) throws -> any MTPDrafterModel {
     if vision {
+        let config = try JSONDecoder().decode(QwenMTPFixtureConfiguration.self, from: configuration)
         return MLXVLM.Qwen35VLMNextNDraftModel(
-            try JSONDecoder().decode(MLXVLM.Qwen35Configuration.self, from: configuration))
+            config.textConfiguration,
+            checkpointPolicy: .init(modelType: config.modelType, preconvertedNorms: false))
     }
     return MLXLLM.Qwen35MTPDraftModel(
         try JSONDecoder().decode(MLXLLM.Qwen35Configuration.self, from: configuration))
+}
+
+private struct QwenMTPFixtureConfiguration: Decodable {
+    let modelType: String
+    let textConfiguration: MLXVLM.Qwen35Configuration.TextConfiguration
+
+    enum CodingKeys: String, CodingKey {
+        case modelType = "model_type"
+        case textConfiguration = "text_config"
+    }
 }
 
 private struct UnusedTokenizerLoader: TokenizerLoader {

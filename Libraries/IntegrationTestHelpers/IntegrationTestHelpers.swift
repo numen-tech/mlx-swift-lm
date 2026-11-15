@@ -247,6 +247,7 @@ public enum IntegrationTestModelIDs {
     public static let mistral3 = "mlx-community/Ministral-3-3B-Instruct-2512-4bit"
     public static let nemotron = "mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-4bit"
     public static let qwen35 = "mlx-community/Qwen3.5-2B-4bit"
+    public static let qwen38 = "mlx-community/Qwen3.8-27B-4bit"
 }
 
 // MARK: - Model Loading
@@ -282,7 +283,7 @@ public actor IntegrationTestModels {
                 try await LLMModelFactory.shared.loadContainer(
                     from: downloader, using: tokenizerLoader,
                     configuration: configuration,
-                    progressHandler: logProgress(key)
+                    progress: .download(logProgress(key))
                 )
             }
             print("Loaded LLM: \(key)")
@@ -317,7 +318,7 @@ public actor IntegrationTestModels {
             let container = try await VLMModelFactory.shared.loadContainer(
                 from: downloader, using: tokenizerLoader,
                 configuration: configuration,
-                progressHandler: logProgress(key)
+                progress: .download(logProgress(key))
             )
             print("Loaded VLM: \(key)")
             return container
@@ -338,7 +339,7 @@ public actor IntegrationTestModels {
             let container = try await EmbedderModelFactory.shared.loadContainer(
                 from: downloader, using: tokenizerLoader,
                 configuration: EmbedderRegistry.nomic_text_v1_5,
-                progressHandler: logProgress(id)
+                progress: .download(logProgress(id))
             )
             print("Loaded embedding model: \(id)")
             return container
@@ -439,12 +440,17 @@ public enum ChatSessionTests {
             case .chunk(let text):
                 print(text, terminator: "")
                 responseText += text
+            case .reasoning:
+                // Thinking is not the answer these checks assert on.
+                break
             case .toolCall(let toolCall):
                 toolCalls.append(toolCall)
             case .rejectedToolCall(let rejection):
                 throw RejectedToolCallError(rejection)
             case .info(let completionInfo):
                 info = completionInfo
+            case .steering:
+                break
             }
         }
         print()
@@ -521,6 +527,8 @@ public enum ChatSessionTests {
             switch generation {
             case .chunk(let text):
                 followUpText += text
+            case .reasoning, .steering:
+                break
             case .toolCall(let call):
                 followUpCalls.append(call)
             case .rejectedToolCall(let rejection):
@@ -644,7 +652,7 @@ public enum EmbedderTests {
         let modelContainer = try await EmbedderModelFactory.shared.loadContainer(
             from: downloader, using: tokenizerLoader,
             configuration: ModelConfiguration(id: modelId),
-            progressHandler: logProgress(modelId)
+            progress: .download(logProgress(modelId))
         )
         print("Loaded Gemma 3 embedding model: \(modelId)")
 
@@ -1260,6 +1268,8 @@ public enum ToolCallTests {
                 switch generation {
                 case .chunk(let chunk):
                     text += chunk
+                case .reasoning, .steering:
+                    break
                 case .toolCall(let toolCall):
                     toolCalls.append(toolCall)
                 case .rejectedToolCall(let rejection):

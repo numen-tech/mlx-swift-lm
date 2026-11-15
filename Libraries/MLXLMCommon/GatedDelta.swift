@@ -335,7 +335,53 @@ func gatedDeltaOps(
     return (y, state)
 }
 
+// MARK: - MLXFast
+
+/// Whether mlx core runs a fused kernel for these inputs, as `use_fallback`
+/// in mlx core. Otherwise it runs a per-step fallback, which is slower than
+/// `gatedDeltaKernel`.
+private func hasFastGatedDelta(q: MLXArray, v: MLXArray, mask: MLXArray?) -> Bool {
+    guard mask == nil, q.dim(3) == 128, v.dim(3) == 128 else { return false }
+    switch (q.dim(2), v.dim(2)) {
+    case (16, 16), (16, 32), (16, 48), (16, 64), (24, 24), (32, 32): return true
+    default: return false
+    }
+}
+
+/// `MLXFast.gatedDeltaUpdate` with `g` and `beta` kept in float32.
+///
+/// mlx core casts `g` and `beta` to the dtype of `q` and `k`. In bf16 a decay
+/// just below 1 rounds to 1, so the state stops decaying (ml-explore/mlx#4725).
+/// Float32 `q` and `k` prevent the cast. Remove the casts when mlx-swift includes
+/// ml-explore/mlx#4760.
+private func fastGatedDelta(
+    q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
+) -> (MLXArray, MLXArray) {
+    let (y, state) = MLXFast.gatedDeltaUpdate(
+        queries: q.asType(.float32), keys: k.asType(.float32), values: v,
+        gamma: g, beta: beta, initialState: state)
+    return (y.asType(q.dtype), state)
+}
+
 // MARK: - Public API
+
+/// Whether `gatedDeltaUpdate` may take `MLXFast.gatedDeltaUpdate` (upstream #740) for the
+/// layouts mlx core fuses.
+///
+/// Off by default on this fork (numen-tech/gemma4-qat#1692): decode, speculative verify and the
+/// rollback replay (`gatedDeltaReplayState`, numen #294) stay on the custom kernel above, whose
+/// numerics the host's Qwen3.5 and Ternary Bonsai 2 goldens were built on. A task-local, so a
+/// host turns it on for one region (a prefill) without touching any other caller:
+/// `GatedDeltaFastRoute.$isEnabled.withValue(true) { ... }`. The route is chosen when the graph
+/// is built, which happens inside the call, so the task-local reaches it.
+///
+/// Even when on, a single-row call keeps the custom kernel: compiled single-token decode traces
+/// (`CompiledTrace`) keep the graph of their first call, so a decode step traced inside an
+/// opted-in region would otherwise carry the fast route into every later step. A rollback-
+/// recorded verify (Qwen3.5 VLM) also keeps the custom kernel, matching its replay.
+public enum GatedDeltaFastRoute {
+    @TaskLocal public static var isEnabled = false
+}
 
 /// The decay gate `g` and write strength `beta` of a GDN layer, in fp32.
 public func gatedDeltaGates(
@@ -388,13 +434,20 @@ public func gatedDeltaUpdate(
     // (`n_per_t = Dk / 32`, integer-truncating). A key head dim that is not a
     // multiple of 32 would silently drop its trailing `Dk % 32` state
     // dimensions and produce wrong output with no error. Stock Qwen3.5 uses
-    // Dk = 192 (a multiple of 32), but the value is config-driven, so route any
+    // Dk = 128 (a multiple of 32), but the value is config-driven, so route any
     // non-multiple-of-32 Dk to the ops fallback, which handles an arbitrary key
     // dimension correctly (slower, but never truncating).
     //
     // `useKernel: false` is for training: the kernel is a custom Metal
     // kernel and has no gradient, so a model in training mode passes
     // `!training` here, as the Python model does with `use_kernel`.
+    //
+    // The MLXFast kernel has a gradient and is faster than both, so upstream
+    // sends the layouts it supports there in training and in inference. On this
+    // fork only a caller that opts in takes it (`GatedDeltaFastRoute`).
+    if GatedDeltaFastRoute.isEnabled, q.dim(1) > 1, hasFastGatedDelta(q: q, v: v, mask: mask) {
+        return fastGatedDelta(q: q, k: k, v: v, g: g, beta: beta, state: state)
+    }
     if useKernel, GatedDeltaKernelManager.shared.kernel != nil, Dk % 32 == 0 {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
     }
@@ -406,6 +459,9 @@ public func gatedDeltaUpdate(
 /// shorter prefix needs. Runs the same kernel (or ops fallback) over the same recorded inputs as
 /// the original pass, so row `t`'s state does not depend on how many rows follow it. `q` is not
 /// an input of the state update; the kernel's API still takes one, so `k` stands in.
+///
+/// Always the kernel the original pass ran by default: `GatedDeltaFastRoute` is off here even
+/// inside a region that turned it on, so a replay never mixes the two kernels' rounding.
 public func gatedDeltaReplayState(
     k: MLXArray,
     v: MLXArray,
@@ -414,7 +470,9 @@ public func gatedDeltaReplayState(
     state: MLXArray?,
     useKernel: Bool = true
 ) -> MLXArray {
-    gatedDeltaUpdate(
-        q: k, k: k, v: v, g: g, beta: beta, state: state, mask: nil, useKernel: useKernel
-    ).1
+    GatedDeltaFastRoute.$isEnabled.withValue(false) {
+        gatedDeltaUpdate(
+            q: k, k: k, v: v, g: g, beta: beta, state: state, mask: nil, useKernel: useKernel
+        ).1
+    }
 }
