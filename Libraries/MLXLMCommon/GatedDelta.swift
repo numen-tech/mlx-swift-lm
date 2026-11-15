@@ -308,7 +308,10 @@ func gatedDeltaOps(
         k = repeated(k, count: repeatFactor, axis: -2)
     }
 
-    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    // A float16 state (`GatedDeltaRecurrentStateStorage`) is stored float16 only: the steps run in
+    // float32, like the kernel's, and the state is rounded back once at the end.
+    let stateType = state?.dtype ?? .float32
+    var state = (state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)).asType(.float32)
 
     var ys = [MLXArray]()
     ys.reserveCapacity((T + gatedDeltaRecomputeChunk - 1) / gatedDeltaRecomputeChunk)
@@ -332,7 +335,7 @@ func gatedDeltaOps(
     }
 
     let y = ys.count == 1 ? ys[0] : MLX.concatenated(ys, axis: 1)
-    return (y, state)
+    return (y, stateType == .float32 ? state : state.asType(stateType))
 }
 
 // MARK: - MLXFast
@@ -356,11 +359,15 @@ private func hasFastGatedDelta(q: MLXArray, v: MLXArray, mask: MLXArray?) -> Boo
 /// (numen-tech/mlx#22: `gated_delta_update` keeps `g` and `beta` float32 whatever the dtype of
 /// `q`), so `q`, `k` and `v` go in as they are (numen-tech/gemma4-qat#1693). The state stays
 /// float32 inside the op either way.
+///
+/// mlx core reads the initial state into float32 and returns a float32 state; a float16 state
+/// (`GatedDeltaRecurrentStateStorage`) is rounded back once at the end of the call.
 private func fastGatedDelta(
     q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
 ) -> (MLXArray, MLXArray) {
-    MLXFast.gatedDeltaUpdate(
+    let (y, newState) = MLXFast.gatedDeltaUpdate(
         queries: q, keys: k, values: v, gamma: g, beta: beta, initialState: state)
+    return (y, newState.dtype == state.dtype ? newState : newState.asType(state.dtype))
 }
 
 /// The fewest rows `GatedDeltaFastRoute` sends to `MLXFast.gatedDeltaUpdate`.
@@ -390,6 +397,19 @@ public let gatedDeltaFastRouteMinRows = 9
 /// rollback-recorded verify (Qwen3.5 VLM) also keeps the custom kernel, matching its replay.
 public enum GatedDeltaFastRoute {
     @TaskLocal public static var isEnabled = false
+}
+
+/// A Gated DeltaNet layer whose recurrent state a caller may store in float16
+/// (numen-tech/gemma4-qat#1697).
+///
+/// `.float32` (the default) is what every layer stored before. With `.float16` the layer seeds a
+/// fresh cache with float16 zeros, and `gatedDeltaUpdate` keeps a float16 state float16: every
+/// path reads it into float32, runs the recurrence in float32 and rounds the new state to float16
+/// once per call (the custom kernel per call, `MLXFast.gatedDeltaUpdate` and the ops fallback the
+/// same way). Set it before the first forward: a compiled decode trace keeps the dtype it was
+/// traced with.
+public protocol GatedDeltaRecurrentStateStorage: AnyObject {
+    var recurrentStateDType: DType { get set }
 }
 
 /// The decay gate `g` and write strength `beta` of a GDN layer, in fp32.
@@ -433,9 +453,11 @@ public func gatedDeltaUpdate(
     let Dv = v.dim(3)
 
     // State kept in fp32 to match Python mlx-lm. Using q.dtype (bf16) loses
-    // precision across T-step recurrence, compounding rounding error.
+    // precision across T-step recurrence, compounding rounding error. A float16 state is a
+    // caller's storage choice (`GatedDeltaRecurrentStateStorage`): it stays float16 between
+    // calls, and every path below still runs the recurrence in float32.
     var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
-    if state.dtype != .float32 {
+    if state.dtype != .float32 && state.dtype != .float16 {
         state = state.asType(.float32)
     }
 

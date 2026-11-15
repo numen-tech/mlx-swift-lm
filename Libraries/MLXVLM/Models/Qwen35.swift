@@ -602,7 +602,7 @@ public enum Qwen35Language {
         }
     }
 
-    open class GatedDeltaNet: Module {
+    open class GatedDeltaNet: Module, GatedDeltaRecurrentStateStorage {
         let hiddenSize: Int
         let numVHeads: Int
         let numKHeads: Int
@@ -636,6 +636,9 @@ public enum Qwen35Language {
 
         @ModuleInfo(key: "norm") var norm: RMSNormGated
         @ModuleInfo(key: "out_proj") var outProj: Linear
+
+        /// `GatedDeltaRecurrentStateStorage`: float32 unless the caller opts in to float16.
+        public var recurrentStateDType: DType = .float32
 
         public init(_ args: Qwen35Configuration.TextConfiguration) {
             self.hiddenSize = args.hiddenSize
@@ -806,8 +809,13 @@ public enum Qwen35Language {
             // a shorter prefix (`MambaCache.beginRollbackRecording`). The checkpoint split is the
             // older single-depth mechanism; the two are not combined.
             let recording = cache?.isRecordingRollback == true && checkpointAfter == nil
+            // A float32 state stays implicit (`gatedDeltaUpdate` builds the zeros), as before.
+            let recState =
+                cache?[1]
+                ?? (recurrentStateDType == .float32
+                    ? nil : zeroStates(batch: inputs.dim(0), dtype: inputs.dtype).rec)
             let result = forward(
-                inputs, convState: convState, recState: cache?[1], mask: mask,
+                inputs, convState: convState, recState: recState, mask: mask,
                 checkpointAfter: checkpointAfter, recordRollback: recording)
             if recording, let cache {
                 if let rollback = result.rollback {
@@ -835,7 +843,7 @@ public enum Qwen35Language {
                 MLXArray.zeros(
                     [batch, max(0, convKernelSize - 1), convDim], dtype: dtype),
                 MLXArray.zeros(
-                    [batch, numVHeads, headVDim, headKDim], dtype: .float32)
+                    [batch, numVHeads, headVDim, headKDim], dtype: recurrentStateDType)
             )
         }
 

@@ -409,4 +409,50 @@ public class GatedDeltaTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - Float16 state storage (numen-tech/gemma4-qat#1697)
+
+    /// A float16 state is storage only, on every path: it comes back float16, and each call runs
+    /// the float32 recurrence from the stored values and rounds the new state once. So a call from
+    /// a float16 state equals, bit for bit, the same call from those values held in float32 with
+    /// its new state rounded to float16, and the outputs are identical.
+    func testFloat16StateIsStorageOnlyOnEveryPath() throws {
+        let inputs = makeQwen35Inputs(T: 37)
+        func run(_ state: MLXArray?, useKernel: Bool = true) -> (MLXArray, MLXArray) {
+            gatedDeltaUpdate(
+                q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
+                aLog: inputs.aLog, dtBias: inputs.dtBias, state: state, useKernel: useKernel)
+        }
+        let stored = run(nil).1.asType(.float16)
+        let paths: [(String, (MLXArray) -> (MLXArray, MLXArray))] = [
+            ("custom kernel", { run($0) }),
+            ("ops", { run($0, useKernel: false) }),
+            ("MLXFast", { state in GatedDeltaFastRoute.$isEnabled.withValue(true) { run(state) } }),
+        ]
+        for (name, path) in paths {
+            let (y16, state16) = path(stored)
+            let (y32, state32) = path(stored.asType(.float32))
+            XCTAssertEqual(state16.dtype, .float16, name)
+            XCTAssertEqual(state32.dtype, .float32, name)
+            XCTAssertEqual(y16.dtype, inputs.q.dtype, name)
+            XCTAssertTrue(arrayEqual(y16, y32).item(Bool.self), "\(name): outputs")
+            XCTAssertTrue(
+                arrayEqual(state16, state32.asType(.float16)).item(Bool.self), "\(name): state")
+        }
+    }
+
+    /// Without a state the recurrence starts from float32 zeros, and a bfloat16 state is still
+    /// widened to float32: only float16 is kept as a storage dtype.
+    func testStateDTypeDefaultsStayFloat32() throws {
+        let inputs = makeQwen35Inputs(T: 4)
+        func state(after initial: MLXArray?) -> DType {
+            gatedDeltaUpdate(
+                q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
+                aLog: inputs.aLog, dtBias: inputs.dtBias, state: initial
+            ).1.dtype
+        }
+        XCTAssertEqual(state(after: nil), .float32)
+        XCTAssertEqual(state(after: MLXArray.zeros([1, 32, 128, 128], dtype: .bfloat16)), .float32)
+        XCTAssertEqual(state(after: MLXArray.zeros([1, 32, 128, 128], dtype: .float16)), .float16)
+    }
 }

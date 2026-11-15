@@ -179,7 +179,7 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
-final class Qwen35GatedDeltaNet: Module {
+final class Qwen35GatedDeltaNet: Module, GatedDeltaRecurrentStateStorage {
     let hiddenSize: Int
     let numVHeads: Int
     let numKHeads: Int
@@ -206,6 +206,9 @@ final class Qwen35GatedDeltaNet: Module {
 
     @ModuleInfo(key: "norm") var norm: Qwen3NextRMSNormGated
     @ModuleInfo(key: "out_proj") var outProj: Linear
+
+    /// `GatedDeltaRecurrentStateStorage`: float32 unless the caller opts in to float16.
+    var recurrentStateDType: DType = .float32
 
     init(_ args: Qwen35TextConfiguration) {
         self.hiddenSize = args.hiddenSize
@@ -353,8 +356,13 @@ final class Qwen35GatedDeltaNet: Module {
     ) -> MLXArray {
         let convState =
             cache?[0] ?? zeroStates(batch: inputs.dim(0), dtype: inputs.dtype).conv
+        // A float32 state stays implicit (`gatedDeltaUpdate` builds the zeros), as before.
+        let recState =
+            cache?[1]
+            ?? (recurrentStateDType == .float32
+                ? nil : zeroStates(batch: inputs.dim(0), dtype: inputs.dtype).rec)
         let (out, newConvState, newRecState, checkpoint) = forward(
-            inputs, convState: convState, recState: cache?[1], mask: mask,
+            inputs, convState: convState, recState: recState, mask: mask,
             checkpointAfter: checkpointAfter)
         if let cache {
             if let checkpoint, let checkpointAfter {
@@ -375,7 +383,7 @@ final class Qwen35GatedDeltaNet: Module {
     func zeroStates(batch: Int, dtype: DType) -> (conv: MLXArray, rec: MLXArray) {
         (
             MLXArray.zeros([batch, convKernelSize - 1, convDim], dtype: dtype),
-            MLXArray.zeros([batch, numVHeads, headVDim, headKDim], dtype: .float32)
+            MLXArray.zeros([batch, numVHeads, headVDim, headKDim], dtype: recurrentStateDType)
         )
     }
 
