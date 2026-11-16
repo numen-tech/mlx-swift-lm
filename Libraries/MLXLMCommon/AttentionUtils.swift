@@ -190,16 +190,9 @@ package func quantizedCacheAttention(
     // Scales carry one entry per group, so they recover the value head dim for any mode.
     let valueHeadDim = quantizedValues.1.dim(-1) * groupSize
     if usesDequantizedPrefillAttention(queries: queries, valueHeadDim: valueHeadDim) {
-        // Prefill over a quantized cache: dequantize once and run the fused kernel
-        // instead of materializing [B, H, L, N] scores through quantized matmuls.
-        let keys = dequantized(
-            quantizedKeys.0, scales: quantizedKeys.1, biases: quantizedKeys.2,
-            groupSize: groupSize, bits: bits, mode: mode, dtype: queries.dtype)
-        let values = dequantized(
-            quantizedValues.0, scales: quantizedValues.1, biases: quantizedValues.2,
-            groupSize: groupSize, bits: bits, mode: mode, dtype: queries.dtype)
-        return MLXFast.scaledDotProductAttention(
-            queries: queries, keys: keys, values: values, scale: scale, mask: mask)
+        return dequantizedPrefillAttention(
+            queries: queries, quantizedKeys: quantizedKeys, quantizedValues: quantizedValues,
+            scale: scale, mask: mask, groupSize: groupSize, bits: bits, mode: mode)
     }
     return quantizedScaledDotProductAttention(
         queries: queries, quantizedKeys: quantizedKeys, quantizedValues: quantizedValues,
@@ -228,4 +221,34 @@ package func usesDequantizedPrefillAttention(queries: MLXArray, valueHeadDim: In
     return queries.dim(2) >= dequantizedPrefillAttentionMinimumLength
         && headDim == valueHeadDim
         && dequantizedPrefillAttentionHeadDims.contains(headDim)
+}
+
+/// Prefill over a quantized cache: dequantize once and run the fused kernel instead of
+/// materializing [B, H, L, N] scores through quantized matmuls.
+///
+/// Kept out of line on purpose. Every decode step over a quantized cache passes through
+/// ``quantizedCacheAttention`` and takes the other branch. With this body inlined there,
+/// MiniCPM5 1B with 8-bit KV decoded 2-3 % slower on an M5 iPad (pipelined decode),
+/// although the counters showed this branch never ran in those turns and the matmul kernel
+/// counts were unchanged. Out of line, decode matched the build without this route, and
+/// the prefill gain stayed (numen-tech/gemma4-qat#1725).
+@inline(never)
+private func dequantizedPrefillAttention(
+    queries: MLXArray,
+    quantizedKeys: (MLXArray, MLXArray, MLXArray?),
+    quantizedValues: (MLXArray, MLXArray, MLXArray?),
+    scale: Float,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode,
+    groupSize: Int,
+    bits: Int,
+    mode: QuantizationMode
+) -> MLXArray {
+    let keys = dequantized(
+        quantizedKeys.0, scales: quantizedKeys.1, biases: quantizedKeys.2,
+        groupSize: groupSize, bits: bits, mode: mode, dtype: queries.dtype)
+    let values = dequantized(
+        quantizedValues.0, scales: quantizedValues.1, biases: quantizedValues.2,
+        groupSize: groupSize, bits: bits, mode: mode, dtype: queries.dtype)
+    return MLXFast.scaledDotProductAttention(
+        queries: queries, keys: keys, values: values, scale: scale, mask: mask)
 }
