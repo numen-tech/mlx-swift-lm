@@ -316,9 +316,11 @@ public class GatedDeltaTests: XCTestCase {
 
     /// A decay just below 1 must still decay the state.
     ///
-    /// In bf16, 0.999 rounds to 1. mlx core casts `g` to the dtype of `q`, so
-    /// without float32 `q` and `k` the state stops decaying and drifts away
-    /// from the custom kernel, which keeps `g` in float32 (ml-explore/mlx#4725).
+    /// In bf16, 0.999 rounds to 1. mlx core used to cast `g` to the dtype of `q`, so the state
+    /// stopped decaying and drifted away from the custom kernel, which keeps `g` in float32
+    /// (ml-explore/mlx#4725). This fork's core keeps `g` and `beta` float32 (ml-explore/mlx#4760),
+    /// and the fast route feeds bf16 `q` and `k` as they are (numen-tech/gemma4-qat#1693), so this
+    /// checks the core's fix, not a cast in Swift.
     ///
     /// On NAX hardware mlx core runs a chunked kernel that drifts more over 256
     /// steps. A lost decay still drifts far more than that.
@@ -342,10 +344,11 @@ public class GatedDeltaTests: XCTestCase {
         }
     }
 
-    /// The fork's routing (numen-tech/gemma4-qat#1692): without an opt-in a fused layout keeps
-    /// the custom kernel, bit for bit; inside one, a multi-row call takes the MLXFast kernel
-    /// (different rounding) and a single-row call does not, so a compiled decode trace built
-    /// inside an opted-in region cannot carry the fast route into later steps.
+    /// The fork's routing (numen-tech/gemma4-qat#1692, #1693): without an opt-in a fused layout
+    /// keeps the custom kernel, bit for bit; inside one, a call of `gatedDeltaFastRouteMinRows`
+    /// rows or more takes the MLXFast kernel (different rounding) and a shorter one does not, so a
+    /// compiled decode trace built inside an opted-in region cannot carry the fast route into later
+    /// steps, and the rows mlx core would run step by step stay on the custom kernel.
     func testGatedDeltaFastRouteIsOptInAndMultiRowOnly() throws {
         func run(_ inputs: Inputs) -> (MLXArray, MLXArray) {
             gatedDeltaUpdate(
@@ -364,10 +367,17 @@ public class GatedDeltaTests: XCTestCase {
         XCTAssertTrue(identical(byDefault, forcedOff), "the default must be the custom kernel")
         XCTAssertFalse(identical(byDefault, optedIn), "an opt-in must reach the MLXFast kernel")
 
-        let step = makeQwen35Inputs(T: 1)
-        XCTAssertTrue(
-            identical(run(step), GatedDeltaFastRoute.$isEnabled.withValue(true) { run(step) }),
-            "a single-row call keeps the custom kernel inside an opt-in")
+        for rows in [1, gatedDeltaFastRouteMinRows - 1] {
+            let short = makeQwen35Inputs(T: rows)
+            XCTAssertTrue(
+                identical(run(short), GatedDeltaFastRoute.$isEnabled.withValue(true) { run(short) }),
+                "a \(rows)-row call keeps the custom kernel inside an opt-in")
+        }
+        let shortest = makeQwen35Inputs(T: gatedDeltaFastRouteMinRows)
+        XCTAssertFalse(
+            identical(
+                run(shortest), GatedDeltaFastRoute.$isEnabled.withValue(true) { run(shortest) }),
+            "a \(gatedDeltaFastRouteMinRows)-row call takes the MLXFast kernel inside an opt-in")
     }
 
     /// Training must differentiate through the MLXFast kernel and get the
@@ -398,5 +408,51 @@ public class GatedDeltaTests: XCTestCase {
                 )
             }
         }
+    }
+
+    // MARK: - Float16 state storage (numen-tech/gemma4-qat#1697)
+
+    /// A float16 state is storage only, on every path: it comes back float16, and each call runs
+    /// the float32 recurrence from the stored values and rounds the new state once. So a call from
+    /// a float16 state equals, bit for bit, the same call from those values held in float32 with
+    /// its new state rounded to float16, and the outputs are identical.
+    func testFloat16StateIsStorageOnlyOnEveryPath() throws {
+        let inputs = makeQwen35Inputs(T: 37)
+        func run(_ state: MLXArray?, useKernel: Bool = true) -> (MLXArray, MLXArray) {
+            gatedDeltaUpdate(
+                q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
+                aLog: inputs.aLog, dtBias: inputs.dtBias, state: state, useKernel: useKernel)
+        }
+        let stored = run(nil).1.asType(.float16)
+        let paths: [(String, (MLXArray) -> (MLXArray, MLXArray))] = [
+            ("custom kernel", { run($0) }),
+            ("ops", { run($0, useKernel: false) }),
+            ("MLXFast", { state in GatedDeltaFastRoute.$isEnabled.withValue(true) { run(state) } }),
+        ]
+        for (name, path) in paths {
+            let (y16, state16) = path(stored)
+            let (y32, state32) = path(stored.asType(.float32))
+            XCTAssertEqual(state16.dtype, .float16, name)
+            XCTAssertEqual(state32.dtype, .float32, name)
+            XCTAssertEqual(y16.dtype, inputs.q.dtype, name)
+            XCTAssertTrue(arrayEqual(y16, y32).item(Bool.self), "\(name): outputs")
+            XCTAssertTrue(
+                arrayEqual(state16, state32.asType(.float16)).item(Bool.self), "\(name): state")
+        }
+    }
+
+    /// Without a state the recurrence starts from float32 zeros, and a bfloat16 state is still
+    /// widened to float32: only float16 is kept as a storage dtype.
+    func testStateDTypeDefaultsStayFloat32() throws {
+        let inputs = makeQwen35Inputs(T: 4)
+        func state(after initial: MLXArray?) -> DType {
+            gatedDeltaUpdate(
+                q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
+                aLog: inputs.aLog, dtBias: inputs.dtBias, state: initial
+            ).1.dtype
+        }
+        XCTAssertEqual(state(after: nil), .float32)
+        XCTAssertEqual(state(after: MLXArray.zeros([1, 32, 128, 128], dtype: .bfloat16)), .float32)
+        XCTAssertEqual(state(after: MLXArray.zeros([1, 32, 128, 128], dtype: .float16)), .float16)
     }
 }

@@ -308,7 +308,10 @@ func gatedDeltaOps(
         k = repeated(k, count: repeatFactor, axis: -2)
     }
 
-    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    // A float16 state (`GatedDeltaRecurrentStateStorage`) is stored float16 only: the steps run in
+    // float32, like the kernel's, and the state is rounded back once at the end.
+    let stateType = state?.dtype ?? .float32
+    var state = (state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)).asType(.float32)
 
     var ys = [MLXArray]()
     ys.reserveCapacity((T + gatedDeltaRecomputeChunk - 1) / gatedDeltaRecomputeChunk)
@@ -332,7 +335,7 @@ func gatedDeltaOps(
     }
 
     let y = ys.count == 1 ? ys[0] : MLX.concatenated(ys, axis: 1)
-    return (y, state)
+    return (y, stateType == .float32 ? state : state.asType(stateType))
 }
 
 // MARK: - MLXFast
@@ -348,20 +351,32 @@ private func hasFastGatedDelta(q: MLXArray, v: MLXArray, mask: MLXArray?) -> Boo
     }
 }
 
-/// `MLXFast.gatedDeltaUpdate` with `g` and `beta` kept in float32.
+/// `MLXFast.gatedDeltaUpdate` in the activation dtype.
 ///
-/// mlx core casts `g` and `beta` to the dtype of `q` and `k`. In bf16 a decay
-/// just below 1 rounds to 1, so the state stops decaying (ml-explore/mlx#4725).
-/// Float32 `q` and `k` prevent the cast. Remove the casts when mlx-swift includes
-/// ml-explore/mlx#4760.
+/// mlx core used to cast `g` and `beta` to the dtype of `q` and `k`; in bf16 a decay just below 1
+/// rounds to 1 and the state stops decaying (ml-explore/mlx#4725). Upstream (#740) worked around
+/// that with float32 `q` and `k`. This fork's core carries the fix, ml-explore/mlx#4760
+/// (numen-tech/mlx#22: `gated_delta_update` keeps `g` and `beta` float32 whatever the dtype of
+/// `q`), so `q`, `k` and `v` go in as they are (numen-tech/gemma4-qat#1693). The state stays
+/// float32 inside the op either way.
+///
+/// mlx core reads the initial state into float32 and returns a float32 state; a float16 state
+/// (`GatedDeltaRecurrentStateStorage`) is rounded back once at the end of the call.
 private func fastGatedDelta(
     q: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray, beta: MLXArray, state: MLXArray
 ) -> (MLXArray, MLXArray) {
-    let (y, state) = MLXFast.gatedDeltaUpdate(
-        queries: q.asType(.float32), keys: k.asType(.float32), values: v,
-        gamma: g, beta: beta, initialState: state)
-    return (y.asType(q.dtype), state)
+    let (y, newState) = MLXFast.gatedDeltaUpdate(
+        queries: q, keys: k, values: v, gamma: g, beta: beta, initialState: state)
+    return (y, newState.dtype == state.dtype ? newState : newState.asType(state.dtype))
 }
+
+/// The fewest rows `GatedDeltaFastRoute` sends to `MLXFast.gatedDeltaUpdate`.
+///
+/// mlx core runs its chunked kernels only above 8 rows (`gated_delta_chunk_size`: chunks of 8, or
+/// 16 on NAX GPUs); at 8 rows or fewer it runs a per-step kernel, the same recurrence as
+/// `gated_delta_step` without the compensated sum, so there is no chunked kernel to gain there and
+/// such calls keep the custom kernel (numen-tech/gemma4-qat#1693).
+public let gatedDeltaFastRouteMinRows = 9
 
 // MARK: - Public API
 
@@ -375,12 +390,26 @@ private func fastGatedDelta(
 /// `GatedDeltaFastRoute.$isEnabled.withValue(true) { ... }`. The route is chosen when the graph
 /// is built, which happens inside the call, so the task-local reaches it.
 ///
-/// Even when on, a single-row call keeps the custom kernel: compiled single-token decode traces
-/// (`CompiledTrace`) keep the graph of their first call, so a decode step traced inside an
-/// opted-in region would otherwise carry the fast route into every later step. A rollback-
-/// recorded verify (Qwen3.5 VLM) also keeps the custom kernel, matching its replay.
+/// Even when on, a call of fewer than `gatedDeltaFastRouteMinRows` rows keeps the custom kernel:
+/// mlx core would run its per-step kernel there, not a chunked one, and compiled single-token
+/// decode traces (`CompiledTrace`) keep the graph of their first call, so a decode step traced
+/// inside an opted-in region would otherwise carry the fast route into every later step. A
+/// rollback-recorded verify (Qwen3.5 VLM) also keeps the custom kernel, matching its replay.
 public enum GatedDeltaFastRoute {
     @TaskLocal public static var isEnabled = false
+}
+
+/// A Gated DeltaNet layer whose recurrent state a caller may store in float16
+/// (numen-tech/gemma4-qat#1697).
+///
+/// `.float32` (the default) is what every layer stored before. With `.float16` the layer seeds a
+/// fresh cache with float16 zeros, and `gatedDeltaUpdate` keeps a float16 state float16: every
+/// path reads it into float32, runs the recurrence in float32 and rounds the new state to float16
+/// once per call (the custom kernel per call, `MLXFast.gatedDeltaUpdate` and the ops fallback the
+/// same way). Set it before the first forward: a compiled decode trace keeps the dtype it was
+/// traced with.
+public protocol GatedDeltaRecurrentStateStorage: AnyObject {
+    var recurrentStateDType: DType { get set }
 }
 
 /// The decay gate `g` and write strength `beta` of a GDN layer, in fp32.
@@ -424,9 +453,11 @@ public func gatedDeltaUpdate(
     let Dv = v.dim(3)
 
     // State kept in fp32 to match Python mlx-lm. Using q.dtype (bf16) loses
-    // precision across T-step recurrence, compounding rounding error.
+    // precision across T-step recurrence, compounding rounding error. A float16 state is a
+    // caller's storage choice (`GatedDeltaRecurrentStateStorage`): it stays float16 between
+    // calls, and every path below still runs the recurrence in float32.
     var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
-    if state.dtype != .float32 {
+    if state.dtype != .float32 && state.dtype != .float16 {
         state = state.asType(.float32)
     }
 
@@ -445,7 +476,8 @@ public func gatedDeltaUpdate(
     // The MLXFast kernel has a gradient and is faster than both, so upstream
     // sends the layouts it supports there in training and in inference. On this
     // fork only a caller that opts in takes it (`GatedDeltaFastRoute`).
-    if GatedDeltaFastRoute.isEnabled, q.dim(1) > 1, hasFastGatedDelta(q: q, v: v, mask: mask) {
+    if GatedDeltaFastRoute.isEnabled, q.dim(1) >= gatedDeltaFastRouteMinRows,
+        hasFastGatedDelta(q: q, v: v, mask: mask) {
         return fastGatedDelta(q: q, k: k, v: v, g: g, beta: beta, state: state)
     }
     if useKernel, GatedDeltaKernelManager.shared.kernel != nil, Dk % 32 == 0 {
