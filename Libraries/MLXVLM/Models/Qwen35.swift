@@ -926,7 +926,10 @@ public enum Qwen35Language {
                         v: v[0..., ..<rows, 0..., 0...],
                         g: g[0..., ..<rows, 0...],
                         beta: beta[0..., ..<rows, 0...],
-                        state: base[1], useKernel: kernelOK)
+                        // A cold cache's base has no state: start from the pass's own initial
+                        // state (a float16 one when the layer stores float16), so the rebuilt
+                        // state keeps the storage dtype (Codex P2, #1697).
+                        state: base[1] ?? recState, useKernel: kernelOK)
                     let conv =
                         window > 0
                         ? contiguous(convInput[0..., rows ..< (rows + window), 0...]) : nil

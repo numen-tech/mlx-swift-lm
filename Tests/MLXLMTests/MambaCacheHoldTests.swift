@@ -275,6 +275,28 @@ final class MambaCacheHoldTests: XCTestCase {
         try assertRewindReplays(compiled: true)
     }
 
+    /// numen-tech/gemma4-qat#1697 (Codex P2): a verify pass recorded on a cold cache, then a
+    /// partial commit, rebuilds the state from the pass's own initial state, so a layer that
+    /// stores float16 still holds float16 after the rollback (float32 by default).
+    func testColdRollbackKeepsTheStorageDType() throws {
+        for dtype in [DType.float32, .float16] {
+            let model = try makeModel(seed: 47)
+            let storages = model.modules().compactMap { $0 as? GatedDeltaRecurrentStateStorage }
+            XCTAssertFalse(storages.isEmpty)
+            for storage in storages { storage.recurrentStateDType = dtype }
+            let mamba = MambaCache()
+            let cache: [KVCache?] = [mamba, KVCacheSimple()]
+            mamba.beginRollbackRecording()
+            let input = MLXArray(Array(tokens.prefix(4))).reshaped(1, 4)
+            let positionIds = MLXArray(
+                (0 ..< 3).flatMap { axis in positions.prefix(4).map { $0[axis] } }
+            ).reshaped(3, 1, 4)
+            eval(model.forward(input, cache: cache, positionIds: positionIds, useCompiledDecode: false))
+            XCTAssertTrue(mamba.commitRollback(keepingRows: 2), "\(dtype)")
+            XCTAssertEqual(mamba[1]?.dtype, dtype, "the rebuilt state keeps the storage dtype")
+        }
+    }
+
     /// A prefill chunk (more than one token) never leaves a hold, so a trim after prefill is
     /// refused rather than restoring the wrong state.
     func testPrefillLeavesNothingHeld() throws {
