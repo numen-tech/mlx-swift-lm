@@ -1430,6 +1430,7 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
 
     @Test("quantizedScaledDotProductAttention normalizes the scores in float32 (precise softmax)")
     func quantizedAttentionSoftmaxIsPrecise() throws {
+        #expect(quantizedAttentionSoftmaxRevision == 1)
         try withRandomState(MLXRandom.RandomState(seed: 0)) {
             // One decode row over a long fp16 cache: the case where a half-precision softmax
             // sum drifts from the float32 one.

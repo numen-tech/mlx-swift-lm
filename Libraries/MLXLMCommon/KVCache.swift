@@ -3058,6 +3058,12 @@ public typealias StandardKVCache = KVCacheSimple
 
 // MARK: - Quantized Attention Operations
 
+/// The softmax revision of `quantizedScaledDotProductAttention`: 1 since it normalizes with the
+/// precise (float32) softmax, as mlx-lm does (numen-tech/gemma4-qat#1863). A caller that names
+/// the KV a quantized cache writes after that change (gemma4-qat's persisted-KV token) reads this,
+/// so a stale checkout without it fails to compile instead of stamping old-softmax KV as new.
+public let quantizedAttentionSoftmaxRevision = 1
+
 public func quantizedScaledDotProductAttention(
     queries: MLXArray,
     quantizedKeys: (MLXArray, MLXArray, MLXArray?),
