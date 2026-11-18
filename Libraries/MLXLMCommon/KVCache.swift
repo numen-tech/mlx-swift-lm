@@ -3123,7 +3123,11 @@ public func quantizedScaledDotProductAttention(
         break
     }
 
-    let attentionWeights = softmax(scores, axis: -1)
+    // `precise`: accumulate in float32, as mlx-lm's `quantized_scaled_dot_product_attention`
+    // does (`mx.softmax(scores, axis=-1, precise=True)`). Without it a half-precision cache's
+    // scores were normalized in half, a gap to the Python reference that grows with the key
+    // length (numen-tech/gemma4-qat#1863).
+    let attentionWeights = softmax(scores, axis: -1, precise: true)
 
     // Compute output using quantized matmul
     var output = quantizedMM(
