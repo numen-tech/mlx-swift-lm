@@ -1424,6 +1424,49 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
         }
     }
 
+    // MARK: - Quantized attention softmax precision
+    // numen-tech/gemma4-qat#1863: mlx-lm normalizes the quantized attention scores with
+    // `mx.softmax(..., precise=True)`; the Swift port did it in the score dtype.
+
+    @Test("quantizedScaledDotProductAttention normalizes the scores in float32 (precise softmax)")
+    func quantizedAttentionSoftmaxIsPrecise() throws {
+        #expect(quantizedAttentionSoftmaxRevision == 1)
+        try withRandomState(MLXRandom.RandomState(seed: 0)) {
+            // One decode row over a long fp16 cache: the case where a half-precision softmax
+            // sum drifts from the float32 one.
+            let (B, H, S, D) = (1, 2, 4096, 64)
+            let scale = 1.0 / Float(D).squareRoot()
+            let q = (MLXRandom.normal([B, H, 1, D]) * 3).asType(.float16)
+            let k = MLXRandom.normal([B, H, S, D]).asType(.float16)
+            let v = MLXRandom.normal([B, H, S, D]).asType(.float16)
+
+            let cache = QuantizedKVCache(groupSize: 64, bits: 8)
+            let (qK, qV) = cache.updateQuantized(keys: k, values: v)
+
+            // The function's own steps, with the softmax precision as the only variable.
+            func reference(precise: Bool) -> MLXArray {
+                let scores = quantizedMM(
+                    q * scale, qK.0, scales: qK.1, biases: qK.2, transpose: true,
+                    groupSize: cache.groupSize, bits: cache.bits, mode: cache.mode)
+                let weights = softmax(scores, axis: -1, precise: precise)
+                return quantizedMM(
+                    weights, qV.0, scales: qV.1, biases: qV.2, transpose: false,
+                    groupSize: cache.groupSize, bits: cache.bits, mode: cache.mode)
+            }
+            let precise = reference(precise: true)
+            let fast = reference(precise: false)
+            // The inputs must tell the two apart, or the check below proves nothing.
+            try #require(!arrayEqual(precise, fast).item(Bool.self))
+
+            let out = quantizedScaledDotProductAttention(
+                queries: q, quantizedKeys: qK, quantizedValues: qV,
+                scale: scale, mask: .none,
+                groupSize: cache.groupSize, bits: cache.bits, mode: cache.mode)
+            #expect(out.dtype == .float16)
+            #expect(arrayEqual(out, precise).item(Bool.self), "not the precise (float32) softmax")
+        }
+    }
+
     // MARK: - Quantized attention head dims
     // Regression for #652: MLA caches store [kvLatent, kPe] as keys and only kvLatent as
     // values, so the GQA output reshape must follow the value head dim, not the query one.
