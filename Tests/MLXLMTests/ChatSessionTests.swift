@@ -223,6 +223,138 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertEqual(rendered?.last?.content, "give temperatures in Celsius")
     }
 
+    func testInterruptKeepsTheReplyAndContinuesTheCache() async throws {
+        let (ready, readyContinuation) = AsyncStream<Void>.makeStream()
+        let (messages, messageContinuation) = AsyncStream<[RecordedMessage]>.makeStream()
+        let gate = SteeringGate()
+        let tokenizer = PrefixPreservingTokenizer(
+            renderedLengthContinuation: AsyncStream<Int>.makeStream().continuation)
+        let configuration = ModelConfiguration(id: "interrupt-test")
+        let base = TestInputProcessor(
+            tokenizer: tokenizer, configuration: configuration,
+            messageGenerator: RecordingMessageGenerator(continuation: messageContinuation))
+        let processor = GatedSteeringProcessor(base: base, ready: readyContinuation, gate: gate)
+        let session = ChatSession(
+            Self.makeModel(
+                processor: processor, configuration: configuration, tokenizer: tokenizer),
+            generateParameters: GenerateParameters(maxTokens: 8, temperature: 0),
+            components: GenerationComponents {
+                ForceTokenSequenceProcessor(state: TokenSequenceState(tokens: [7]))
+            })
+        let stream = session.streamDetails(to: "original task")
+        var readyIterator = ready.makeAsyncIterator()
+        _ = await readyIterator.next()
+        let unapplied = try session.steer("never applied", policy: .nextStepBoundary)
+        try session.interrupt()
+        XCTAssertFalse(session.canSteer())
+        await gate.release()
+
+        var infos: [GenerateCompletionInfo] = []
+        var failures: [SteeringFailure] = []
+        for try await event in stream {
+            if let info = event.info { infos.append(info) }
+            if case .steering(.failed(let failure)) = event { failures.append(failure) }
+            if case .steering(.applied) = event {
+                XCTFail("An interrupted response applies nothing")
+            }
+        }
+        XCTAssertEqual(infos.map(\.stopReason), [.interrupted])
+        XCTAssertEqual(infos.first?.generationTokenCount, 1)
+        XCTAssertEqual(failures.map(\.ids), [[unapplied]])
+        XCTAssertEqual(failures.first?.reason, .responseEnded)
+        XCTAssertThrowsError(try session.interrupt()) {
+            XCTAssertEqual($0 as? SteeringError, .noActiveResponse)
+        }
+
+        let followup = try await collectGeneration(session.streamDetails(to: "next turn"))
+        XCTAssertEqual(
+            followup.info.cachedPromptTokenCount,
+            infos.first.map { $0.promptTokenCount + $0.generationTokenCount })
+        var messageIterator = messages.makeAsyncIterator()
+        _ = await messageIterator.next()
+        let rendered = await messageIterator.next()
+        XCTAssertEqual(rendered?.map(\.role), [.user, .assistant, .user])
+    }
+
+    func testInterruptAnswersToolResultsBeforeTheResponseEnds() async throws {
+        let output = "{\"name\":\"weather\",\"arguments\":{}}"
+        let tokenizer = LiteralTokenizer(output: output + "done")
+        let configuration = ModelConfiguration(
+            id: "interrupt-tool-test", eosTokenIds: [99], toolCallFormat: .json)
+        let (messages, messageContinuation) = AsyncStream<[RecordedMessage]>.makeStream()
+        let base = TestInputProcessor(
+            tokenizer: tokenizer, configuration: configuration,
+            messageGenerator: RecordingMessageGenerator(continuation: messageContinuation))
+        let calls = TokenSequenceState(tokens: [0, 1])
+        let (ready, readyContinuation) = AsyncStream<Void>.makeStream()
+        let gate = SteeringGate()
+        let session = ChatSession(
+            model(processor: base),
+            generateParameters: GenerateParameters(maxTokens: 100, temperature: 0),
+            components: GenerationComponents {
+                let text = calls.current == 0 ? output : "done"
+                calls.advance()
+                return ForceTokenSequenceProcessor(
+                    state: TokenSequenceState(tokens: tokenizer.tokens(for: text) + [99]))
+            },
+            tools: [["function": ["name": "weather"] as [String: any Sendable]]],
+            toolDispatch: { _ in
+                readyContinuation.yield(())
+                await gate.wait()
+                return "sunny"
+            })
+        let stream = session.streamDetails(to: "weather please")
+        var readyIterator = ready.makeAsyncIterator()
+        _ = await readyIterator.next()
+        try session.interrupt()
+        await gate.release()
+        var infos: [GenerateCompletionInfo] = []
+        for try await event in stream {
+            if let info = event.info { infos.append(info) }
+        }
+        XCTAssertEqual(infos.map(\.stopReason), [.stop, .interrupted])
+        XCTAssertEqual(infos.last?.generationTokenCount, 1)
+
+        _ = try await session.respond(to: "thanks")
+        var messageIterator = messages.makeAsyncIterator()
+        _ = await messageIterator.next()
+        _ = await messageIterator.next()
+        let rendered = await messageIterator.next()
+        XCTAssertEqual(rendered?.map(\.role), [.user, .assistant, .tool, .assistant, .user])
+    }
+
+    func testSessionWithoutTranscriptCanStillBeInterrupted() async throws {
+        let (ready, readyContinuation) = AsyncStream<Void>.makeStream()
+        let gate = SteeringGate()
+        let tokenizer = PrefixPreservingTokenizer(
+            renderedLengthContinuation: AsyncStream<Int>.makeStream().continuation)
+        let configuration = ModelConfiguration(id: "raw-cache-interrupt-test")
+        let base = TestInputProcessor(
+            tokenizer: tokenizer, configuration: configuration,
+            messageGenerator: DefaultMessageGenerator())
+        let processor = GatedSteeringProcessor(base: base, ready: readyContinuation, gate: gate)
+        let context = Self.makeModel(
+            processor: processor, configuration: configuration, tokenizer: tokenizer)
+        let session = ChatSession(
+            context, cache: try context.model.newCache(parameters: nil),
+            generateParameters: GenerateParameters(maxTokens: 8, temperature: 0),
+            components: GenerationComponents {
+                ForceTokenSequenceProcessor(state: TokenSequenceState(tokens: [7]))
+            })
+        let stream = session.streamDetails(to: "hello")
+        var readyIterator = ready.makeAsyncIterator()
+        _ = await readyIterator.next()
+        try session.interrupt()
+        await gate.release()
+
+        var infos: [GenerateCompletionInfo] = []
+        for try await event in stream {
+            if let info = event.info { infos.append(info) }
+        }
+        XCTAssertEqual(infos.map(\.stopReason), [.interrupted])
+        XCTAssertEqual(infos.first?.generationTokenCount, 1)
+    }
+
     func testFailedSteeringPreparationRetainsCompletedToolResult() async throws {
         let output = "{\"name\":\"weather\",\"arguments\":{}}"
         let tokenizer = LiteralTokenizer(output: output + "done")
@@ -655,6 +787,8 @@ public class ChatSessionTests: XCTestCase {
         let tokenizer: Tokenizer
         let configuration = ModelConfiguration(id: "test")
         let messageGenerator = DefaultMessageGenerator()
+        /// Hide the first position, as a left-padding mask would.
+        var padsFirstPosition = false
 
         func prepare(input: UserInput) throws -> LMInput {
             let messages = messageGenerator.generate(from: input)
@@ -662,8 +796,9 @@ public class ChatSessionTests: XCTestCase {
                 messages: messages,
                 tools: input.tools,
                 additionalContext: input.additionalContext)
-            let mask = MLXArray(Array(repeating: 1, count: tokens.count))
-                .reshaped(1, tokens.count)
+            var values = Array(repeating: 1, count: tokens.count)
+            if padsFirstPosition { values[0] = 0 }
+            let mask = MLXArray(values).reshaped(1, tokens.count)
             return LMInput(text: .init(tokens: MLXArray(tokens), mask: mask))
         }
     }
@@ -1646,7 +1781,7 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertEqual(calls[1][1].content, "")
     }
 
-    func testInterruptedGenerationRollsBackIncompleteTurn() async throws {
+    func testCancelledGenerationRollsBackIncompleteTurn() async throws {
         let (recordedMessages, continuation) = AsyncStream<[RecordedMessage]>.makeStream()
         let processor = TestInputProcessor(
             tokenizer: PseudoWordTokenizer(),
@@ -1831,11 +1966,34 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertGreaterThan(second.info.cacheEfficiency, 0)
     }
 
-    func testExactPrefixReuseRebuildsWhenPreparedInputHasMask() async throws {
+    /// An all-ones mask hides nothing, so the cached prefix is reused.
+    func testExactPrefixReuseIgnoresAllOnesMask() async throws {
         let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
         var lengthIterator = renderedLengths.makeAsyncIterator()
         let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
         let processor = MaskedInputProcessor(tokenizer: tokenizer)
+        let session = ChatSession(
+            model(processor: processor),
+            generateParameters: GenerateParameters(maxTokens: 3))
+
+        _ = try await session.respond(to: "first")
+        let firstRenderedLengthValue = await lengthIterator.next()
+        let firstRenderedLength = try XCTUnwrap(firstRenderedLengthValue)
+
+        let second = try await collectGeneration(session.streamDetails(to: "second"))
+        let secondRenderedLengthValue = await lengthIterator.next()
+        let secondRenderedLength = try XCTUnwrap(secondRenderedLengthValue)
+
+        XCTAssertEqual(second.info.cachedPromptTokenCount, firstRenderedLength + 3)
+        XCTAssertEqual(
+            second.info.promptTokenCount, secondRenderedLength - firstRenderedLength - 3)
+    }
+
+    func testExactPrefixReuseRebuildsWhenPreparedInputHasPaddingMask() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = MaskedInputProcessor(tokenizer: tokenizer, padsFirstPosition: true)
         let session = ChatSession(
             model(processor: processor),
             generateParameters: GenerateParameters(maxTokens: 3))
