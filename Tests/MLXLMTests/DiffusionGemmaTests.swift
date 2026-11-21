@@ -1271,6 +1271,25 @@ struct DiffusionGemmaTests {
         #expect(again.videoFrameLimit == 2)
     }
 
+    @Test("The generation loop reports emitted tokens to a canvas processor")
+    func generationLoopNotifiesCanvasProcessorOfEmittedTokens() async throws {
+        let emitted = EmittedTokens()
+        let iterator = try BlockDiffusionTokenIterator(
+            input: LMInput(tokens: MLXArray([9])),
+            model: ScriptedConfidenceDiffusionModel(
+                canvasLength: 3, maxSteps: 1, script: [[(2, 20), (3, 20), (4, 20)]]),
+            parameters: GenerateParameters(maxTokens: 3, temperature: 0),
+            components: .init(logitProcessorFactory: { EmissionRecorder(emitted: emitted) }))
+
+        let (stream, task) = generateTask(
+            promptTokenCount: 1, modelConfiguration: ModelConfiguration(id: "stand-in"),
+            tokenizer: DiffusionGemmaPromptTokenizer(tokens: [9]), iterator: iterator)
+        for await _ in stream {}
+        await task.value
+
+        #expect(emitted.tokens == [2, 3, 4])
+    }
+
     private static func confidenceTokens(
         _ model: ScriptedConfidenceDiffusionModel, count: Int
     ) throws -> [Int] {
@@ -1737,5 +1756,30 @@ private final class ScriptedConfidenceDiffusionModel: Module, BlockDiffusionLang
 
     func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         []
+    }
+}
+
+private final class EmittedTokens: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = [Int]()
+
+    var tokens: [Int] { lock.withLock { storage } }
+
+    func append(_ token: Int) {
+        lock.withLock { storage.append(token) }
+    }
+}
+
+private struct EmissionRecorder: LogitProcessor {
+    let emitted: EmittedTokens
+
+    mutating func prompt(_ prompt: MLXArray) {}
+
+    func process(logits: MLXArray) -> MLXArray { logits }
+
+    mutating func didSample(token: MLXArray) {}
+
+    mutating func didEmit(token: Int) {
+        emitted.append(token)
     }
 }

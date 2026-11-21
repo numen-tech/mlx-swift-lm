@@ -410,6 +410,9 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
         return token
     }
 
+    /// A canvas processor reads emissions (`didEmit`), though no reasoning tokens are counted.
+    public var notifiesEmittedTokens: Bool { processor != nil }
+
     public mutating func recordEmittedToken(_ token: Int) {
         processor?.didEmit(token: token)
     }
