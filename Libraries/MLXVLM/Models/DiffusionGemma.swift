@@ -355,6 +355,9 @@ public final class DiffusionGemma: Module, VLMModel, BlockDiffusionLanguageModel
 
 extension DiffusionGemma {
     public var toolCallFormat: ToolCallFormat? { .gemma4 }
+
+    /// DiffusionGemma thinks in the labeled channels of Gemma 4 (see `ReasoningConfig.gemma4`).
+    public var reasoningConfig: ReasoningConfig? { .gemma4 }
 }
 
 public struct DiffusionGemma4Processor: UserInputProcessor {
@@ -473,6 +476,11 @@ public struct DiffusionGemma4Processor: UserInputProcessor {
         let promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
+
+        if input.images.isEmpty, input.videos.isEmpty {
+            // No mask: one unpadded sequence needs none, and a mask stops prompt-cache reuse.
+            return LMInput(tokens: MLXArray(promptTokens).expandedDimensions(axis: 0))
+        }
 
         let images = try input.images.map {
             MediaProcessing.asMLXArray(
@@ -645,7 +653,14 @@ public struct DiffusionGemma4ProcessorConfiguration: Codable, Sendable {
         try c.encodeIfPresent(eoiTokenId, forKey: .eoiTokenId)
         try c.encode(patchSize, forKey: .patchSize)
         try c.encode(poolingKernelSize, forKey: .poolingKernelSize)
-        try c.encode(videoFrameLimit, forKey: .videoFrameLimit)
+        // Fork patch (numen-tech/mlx-swift-lm#15 review): the decoder reads the video settings
+        // from `video_processor`, so they are written there, not at the top level.
+        try c.encode(
+            NestedImageProcessor(
+                doNormalize: nil, imageMean: nil, imageStd: nil, imageSeqLength: nil,
+                maxSoftTokens: videoSeqLength, patchSize: nil, poolingKernelSize: nil,
+                videoFrameLimit: videoFrameLimit),
+            forKey: .videoProcessor)
     }
 
     public var imageMeanTuple: (CGFloat, CGFloat, CGFloat) {
