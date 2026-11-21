@@ -357,6 +357,13 @@ public struct BlockDiffusionTokenIterator: TokenIteratorProtocol {
             }
         }
 
+        // Fork patch (numen-tech/mlx-swift-lm#15 review): a confidence-threshold canvas keeps the
+        // tokens it has already revealed. The final step, or an early stop, only predicts the
+        // positions still unrevealed; otherwise its argmax would overwrite accepted tokens.
+        if case .confidenceThreshold = diffusionSampler {
+            argmaxCanvas = MLX.where(draftRevealMask, draftCanvas, argmaxCanvas)
+        }
+
         eval(argmaxCanvas)
         pendingTokens = argmaxCanvas.flattened().asArray(Int.self)
         pendingIndex = 0

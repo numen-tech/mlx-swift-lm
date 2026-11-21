@@ -653,7 +653,14 @@ public struct DiffusionGemma4ProcessorConfiguration: Codable, Sendable {
         try c.encodeIfPresent(eoiTokenId, forKey: .eoiTokenId)
         try c.encode(patchSize, forKey: .patchSize)
         try c.encode(poolingKernelSize, forKey: .poolingKernelSize)
-        try c.encode(videoFrameLimit, forKey: .videoFrameLimit)
+        // Fork patch (numen-tech/mlx-swift-lm#15 review): the decoder reads the video settings
+        // from `video_processor`, so they are written there, not at the top level.
+        try c.encode(
+            NestedImageProcessor(
+                doNormalize: nil, imageMean: nil, imageStd: nil, imageSeqLength: nil,
+                maxSoftTokens: videoSeqLength, patchSize: nil, poolingKernelSize: nil,
+                videoFrameLimit: videoFrameLimit),
+            forKey: .videoProcessor)
     }
 
     public var imageMeanTuple: (CGFloat, CGFloat, CGFloat) {
